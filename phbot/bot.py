@@ -20,6 +20,8 @@ from .db import Database
 from .propertyhub import PropertyHub,ProviderError,image_url,price_of,plain_html
 from .filters import DEFAULT,AMENITIES,FACILITIES,ROOM_TYPES,SORTS,clean,concise,matches_local
 from .ranking import score,comparables,age_days
+from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_TARGET,
+                          signature, cache_expired, build_buckets)
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,card_text,card_kb,
@@ -32,8 +34,6 @@ log=logging.getLogger(__name__)
 SEARCH_STANDARD_PAGES = 8
 SEARCH_RARE_PAGES = 48
 SEARCH_RARE_TARGET = 12
-COLLECTION_SCAN_PAGES = 80
-COLLECTION_TARGET = 100
 
 
 @dataclass
@@ -75,6 +75,10 @@ class Application:
         self.catalogs:dict[int,Catalog]={};self.pending:dict[int,tuple[str,str,int]]={}
         self.tasks:set[asyncio.Task]=set();self.started=datetime.now(timezone.utc)
         self.photo_cache:dict[str,str]={};self.sync_lock=asyncio.Lock()
+        # Per-user jobs with debounce; single shared background crawler prevents
+        # concurrent 80-page scans from saturating the PropertyHub API.
+        self.collection_tasks:dict[int,asyncio.Task]={}
+        self.collection_semaphore=asyncio.Semaphore(1)
         self._setup_handlers()
 
     def task(self,coro):
@@ -128,7 +132,17 @@ class Application:
     async def filters(self,uid,chat,kind):
         self.panel_kind[uid]='filter:'+kind
         f=await self.db.get_filters(uid,kind)
-        await self.panel(uid,chat,filter_summary(kind,f),filter_kb(kind,f))
+        text=filter_summary(kind,f)
+        if kind=='latest':
+            cache=await self.db.get_collection_cache(uid)
+            if cache and cache['filter_signature']==signature(f):
+                if cache['status'] in ('pending','building'):
+                    text+='\n\n<i>🏆 Подборки пересчитываются в фоне.</i>'
+                elif cache['status']=='ready':
+                    text+='\n\n<i>🏆 Подборки подготовлены.</i>'
+                elif cache['status']=='error':
+                    text+='\n\n<i>⚠️ Не удалось обновить подборки; повторите в разделе «Подборки».</i>'
+        await self.panel(uid,chat,text,filter_kb(kind,f))
 
     async def district_panel(self,uid,chat,kind,f):
         prefix='f:'+('s' if kind=='search' else 'l')+':'
@@ -215,85 +229,173 @@ class Application:
         if c.next_page>c.total_pages:c.done=True
         return rows
 
-    async def _load_collection(self,c:Catalog):
-        """Fully prepare a bounded comparison pool BEFORE showing its first card.
+    async def _save_filters(self,uid,kind,f):
+        changed=await self.db.save_filters(uid,kind,f)
+        if changed and kind=='latest':
+            self.schedule_collection(uid,replace=True)
+        return changed
 
-        No page-by-page reranking: the order is frozen until a new collection
-        launch. The displayed score itself can still age while in Favorites.
+    def schedule_collection(self,uid,replace=False,delay=1.0):
+        """Debounce consecutive edits; a newer settings revision cancels old work."""
+        existing=self.collection_tasks.get(uid)
+        if existing and not existing.done():
+            if not replace:return existing
+            existing.cancel()
+        task=self.task(self._prepare_collections(uid,delay))
+        self.collection_tasks[uid]=task
+        def clear(finished):
+            if self.collection_tasks.get(uid) is finished:
+                self.collection_tasks.pop(uid,None)
+        task.add_done_callback(clear)
+        return task
+
+    async def ensure_collection(self,uid):
+        """Queue stale/missing snapshots, never request PropertyHub in callbacks."""
+        cache=await self.db.get_collection_cache(uid)
+        if cache and cache['status']=='error' and cache['filter_signature']==signature(
+                await self.db.get_filters(uid,'latest')):
+            return  # explicit retry, or maintenance after delay
+        if await self.db.collection_needs_refresh(uid):
+            self.schedule_collection(uid)
+
+    async def _prepare_collections(self,uid,delay=1.0):
+        """One provider scan for three durable buckets, entirely off the UI path.
+
+        Cache writes are guarded by the settings signature. Cancellation or a
+        failed scan never publishes a partial sorted collection as ready.
         """
-        if c.done or c.load_lock.locked():return
-        async with c.load_lock:
-            gen=c.generation;uid=c.owner
-            c.fetching=True
-            progress=None
-            selected=[];known=set()
-            hidden=set(await self.db.listing_ids(uid,'hidden'))
-            try:
-                progress=await self.bot.send_message(c.chat_id,
-                    '🏆 <b>Формирую подборку…</b>\n'
-                    'Сначала собираю кандидатов и рассчитываю рейтинг, затем открою готовый список.',
-                    parse_mode='HTML')
-                c.progress_message=progress.message_id
-                await self.db.metric(uid,'requests')
-                while c.generation==gen and not c.done and c.scanned_pages<COLLECTION_SCAN_PAGES:
-                    page=c.next_page
-                    rows=await self._provider_page(c,page)
+        sig=None
+        try:
+            if delay:await asyncio.sleep(delay)
+            async with self.collection_semaphore:
+                filters=await self.db.get_filters(uid,'latest')
+                sig=signature(filters)
+                cache=await self.db.get_collection_cache(uid)
+                if (cache and cache['filter_signature']==sig and cache['status']=='ready'
+                        and not cache_expired(cache)):
+                    return
+                if not await self.db.begin_collection_build(uid,sig):return
+                # Ranking overrides the UI sort; use latest first to increase
+                # the probability of covering all 1/7/20-day buckets.
+                scan_filter=dict(filters)
+                scan_filter['sort']='CREATED_AT'
+                seen=set();ids=[];pages=0;skipped=0;total_pages=COLLECTION_SCAN_PAGES
+                hidden=set(await self.db.listing_ids(uid,'hidden'))
+                reader=getattr(self.api,'search_page_resilient',self.api.search_page)
+                for page in range(1,COLLECTION_SCAN_PAGES+1):
+                    rows,meta=await reader(scan_filter,page=page,per_page=60)
+                    pages+=1
+                    skipped+=int(meta.get('skippedCorruptListings') or 0)
+                    total_pages=int(meta.get('totalPages') or total_pages)
                     await self.db.put_listings(rows)
                     for item in rows:
-                        key=str(item.get('id') or '')
-                        if key and key not in known and key not in hidden:
-                            known.add(key);selected.append(key)
-                    if c.scanned_pages%8==0 and progress:
-                        try:
-                            await self.bot.edit_message_text(
-                                f'🏆 <b>Формирую подборку…</b>\n'
-                                f'Проверено страниц: {c.scanned_pages} / {COLLECTION_SCAN_PAGES} · кандидатов: {len(selected)}',
-                                chat_id=c.chat_id,message_id=progress.message_id,parse_mode='HTML')
-                        except TelegramBadRequest:pass
-                    if not c.done:await asyncio.sleep(.15)
-                if gen!=c.generation:return
-                c.done=True
-                if selected:
-                    items=await self.db.listings_by_ids(selected)
-                    # One comparison set, one definitive ranking, one counter.
-                    groups=comparables(items)
-                    ranked=sorted(((score(item,groups)[0],str(item['id'])) for item in items),
-                                  key=lambda x:(-x[0],x[1]))
-                    winners=ranked[:COLLECTION_TARGET]
-                    c.ids=[ident for _,ident in winners]
-                    c.scores=dict((ident,value) for value,ident in winners)
-                    await self._send_card(c,0,replace=False)
-                else:
-                    suffix=' по всей выдаче' if c.next_page>c.total_pages else f' на первых {c.scanned_pages} страницах'
-                    text=('Подходящих квартир не найдено'+suffix+'.\n'
-                          'Это не означает, что вариантов нет в остальном каталоге PropertyHub.')
-                    m=await self.bot.send_message(c.chat_id,text,reply_markup=kb([
-                        [b('⚙️ Настройки','filter:latest')],[b('🏠 Меню','go:home')]]))
-                    c.empty_message=m.message_id
-                if c.scanned_pages>=COLLECTION_SCAN_PAGES and c.next_page<=c.total_pages:
-                    log.info('Collection scanned first %s pages, ranked %s candidates (bounded sample)',
-                             c.scanned_pages,len(selected))
+                        ident=str(item.get('id') or '')
+                        if ident and ident not in seen and ident not in hidden:
+                            ids.append(ident);seen.add(ident)
+                    if pages%5==0 or page>=total_pages:
+                        await self.db.collection_progress(uid,sig,pages,len(ids),skipped)
+                    if page>=total_pages:break
+                    await asyncio.sleep(.15)
+                items=await self.db.listings_by_ids(ids)
+                # Heavy ranking runs in a thread, never blocks Telegram updates.
+                buckets=await asyncio.to_thread(build_buckets,items)
+                saved=await self.db.finish_collection_build(uid,sig,buckets,pages,len(items),skipped)
+                if saved:
+                    log.info('Cached 1/7/20-day collections: user=%s pages=%s candidates=%s sizes=%s',
+                             uid,pages,len(items),{k:len(v) for k,v in buckets.items()})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning('Collection background build failed for user %s: %s',uid,e)
+            if sig is not None:
+                await self.db.fail_collection_build(uid,sig,e)
+
+    async def collections_panel(self,uid,chat):
+        """Status-only UI. Never start an 80-page scan inside this callback."""
+        self.panel_kind[uid]='collections'
+        filters=await self.db.get_filters(uid,'latest')
+        sig=signature(filters)
+        cache=await self.db.get_collection_cache(uid)
+        if not cache or cache['filter_signature']!=sig:
+            text=('<b>🏆 Подборки</b>\n\n⏳ Подготавливаются в фоне по вашим настройкам. '
+                  'Пока расчёт не завершён, готовой подборки нет.\n\n'
+                  'Можно пользоваться другими разделами бота.')
+            available=False
+        else:
+            buckets=cache.get('buckets') or {}
+            available=all(str(d) in buckets for d in WINDOWS)
+            counts=' · '.join(f'{d} дн.: {len(buckets.get(str(d),[]))}' for d in WINDOWS)
+            lines=['<b>🏆 Подборки</b>']
+            if available:
+                lines.append('✅ Готовые списки: '+counts)
+                if cache.get('completed_at'):
+                    lines.append('🕒 Подготовлено: '+esc(cache['completed_at'][:16].replace('T',' ')+' UTC'))
+            status=cache['status']
+            if status in ('pending','building'):
+                lines.append(f'🔄 Пересборка в фоне · проверено {cache["scanned_pages"]} из {COLLECTION_SCAN_PAGES} страниц')
+            elif status=='error':
+                lines.append('⚠️ Последняя пересборка не завершилась: '+esc(str(cache.get('error') or '')[:150]))
+            elif status=='ready':
+                lines.append(f'📊 Проверено {cache["scanned_pages"]} страниц · кандидатов: {cache["candidates"]}')
+            lines.append('<i>Используются только постоянные «Настройки». '
+                         'Это рейтинги ограниченной выборки, не всего PropertyHub.</i>')
+            text='\n\n'.join(lines)
+        buttons=[]
+        if available:
+            buttons.append([b('📅 1 день','go:collection:1'),
+                            b('🗓 7 дней','go:collection:7'),
+                            b('📆 20 дней','go:collection:20')])
+        buttons.append([b('↻ Обновить статус','go:collections')])
+        if cache and cache['filter_signature']==sig and cache['status']=='error':
+            buttons.append([b('🔁 Повторить подготовку','go:collectionretry')])
+        buttons.append([b('⚙️ Настройки','filter:latest'),b('🏠 Меню','go:home')])
+        await self.panel(uid,chat,text,kb(buttons))
+
+    async def collection_from_cache(self,uid,chat,days):
+        """Instant open from SQLite; never calls PropertyHub."""
+        if days not in WINDOWS:
+            await self.collections_panel(uid,chat)
+            return
+        await self.close_catalog(uid)
+        filters=await self.db.get_filters(uid,'latest')
+        cache=await self.db.get_collection_cache(uid)
+        if not cache or cache['filter_signature']!=signature(filters) or str(days) not in cache.get('buckets',{}):
+            await self.ensure_collection(uid)
+            await self.collections_panel(uid,chat)
+            return
+        ids=cache['buckets'][str(days)]
+        hidden=set(await self.db.listing_ids(uid,'hidden'))
+        data=await self.db.listings_by_ids(ids)
+        # An old snapshot must never show a listing that aged beyond the chosen
+        # window or no longer matches the latest settings.
+        allowed={str(item['id']) for item in data if age_days(item)<=days and matches_local(item,filters)}
+        shown=[ident for ident in ids if ident in allowed and ident not in hidden]
+        if not shown:
+            await self.panel(uid,chat,
+                f'<b>🏆 Подборка · {days} дней</b>\n\n'
+                'В подготовленном списке пока нет подходящих объявлений. '
+                'Новые варианты появятся после фонового обновления.',
+                kb([[b('← Подборки','go:collections')],[b('⚙️ Настройки','filter:latest')]]))
+            return
+        c=Catalog(chat,uid,'collection',f'Подборка за {days} дней',filters,ids=shown,done=True)
+        self.catalogs[uid]=c
+        await self._send_card(c,0,replace=False)
+
+    async def collection_maintenance(self):
+        """Recover pending builds on restart; refresh active users periodically."""
+        while True:
+            try:
+                for uid in await self.db.active_collection_users(days=30,limit=200):
+                    if await self.db.collection_needs_refresh(uid):
+                        self.schedule_collection(uid)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log.warning('collection error: %s',exc)
-                if gen==c.generation:
-                    m=await self.bot.send_message(c.chat_id,
-                        '⚠️ Не удалось закончить подборку: '+esc(str(exc)[:220]),
-                        parse_mode='HTML',reply_markup=kb([[b('↻ Повторить','go:collections')],
-                                                           [b('🏠 Меню','go:home')]]))
-                    c.empty_message=m.message_id
-            finally:
-                c.fetching=False
-                if progress:
-                    await self.safe_delete(c.chat_id,progress.message_id)
-                    if c.progress_message==progress.message_id:c.progress_message=None
+            except Exception:
+                log.exception('Collection maintenance')
+            await asyncio.sleep(30*60)
 
     async def _load(self,c:Catalog):
         """Page-by-page search, with deeper bounded bursts for rare local filters."""
-        if c.source=='collection':
-            await self._load_collection(c)
-            return
         if c.done or c.load_lock.locked():return
         async with c.load_lock:
             gen=c.generation;uid=c.owner
@@ -425,13 +527,9 @@ class Application:
             self.catalogs[uid]=c;await self._send_card(c,0,replace=False)
             return
         if kind.startswith('collection:'):
-            days=int(kind.split(':')[-1])
-            f=await self.db.get_filters(uid,'latest')
-            # The preset applies on top of the CURRENT persistent profile.
-            cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).date().isoformat()
-            if not f.get('date_from') or f['date_from']<cutoff:f['date_from']=cutoff
-            c=Catalog(chat,uid,'collection',f'Подборка за {days} дн.',clean(f))
-            self.catalogs[uid]=c;c.worker=self.task(self._load(c))
+            try:days=int(kind.split(':')[-1])
+            except ValueError:return
+            await self.collection_from_cache(uid,chat,days)
 
     async def show_detail(self,c:Catalog):
         if not c.ids:return
@@ -588,6 +686,7 @@ class Application:
             uid=message.from_user.id;await self.db.user(message.from_user)
             await self.close_catalog(uid)
             await self.home(uid,message.chat.id)
+            await self.ensure_collection(uid)
             await self.safe_delete(message.chat.id,message.message_id)
 
         @r.message(Command('menu'))
@@ -611,10 +710,11 @@ class Application:
             elif action=='favorites':await self.launch(uid,chat,'favorites')
             elif action=='collections':
                 await self.close_catalog(uid)
-                self.panel_kind[uid]='collections'
-                await self.panel(uid,chat,'<b>🏆 Подборки</b>\n\nЛучшие варианты по цене, цене за м², площади, этажу, спальням, депозиту, свежести и району.\n\n<i>Рейтинг по загруженной выборке. Используются только текущие постоянные настройки.</i>',kb([
-                    [b('📅 1 день','go:collection:1'),b('🗓 7 дней','go:collection:7'),b('📆 30 дней','go:collection:30')],
-                    [b('← Меню','go:home')]]))
+                await self.ensure_collection(uid)
+                await self.collections_panel(uid,chat)
+            elif action=='collectionretry':
+                self.schedule_collection(uid,replace=True,delay=0)
+                await self.collections_panel(uid,chat)
             elif action.startswith('collection:'):await self.launch(uid,chat,action)
             elif action=='market':await self.close_catalog(uid);await self.market(uid,chat)
             elif action=='admin':await self.close_catalog(uid);await self.admin(uid,chat)
@@ -646,7 +746,7 @@ class Application:
                     f['region']=val if val in CITIES else ''
                     f['location_text']=''
                     f['district_ids']=[]
-                    await self.db.save_filters(uid,kind,f)
+                    await self._save_filters(uid,kind,f)
                 await self.filters(uid,chat,kind);return
             if action=='location':
                 rows=[[b('🏙 Бангкок',prefix+'locpreset:bangkok'),b('🌊 Паттайя',prefix+'locpreset:pattaya')],
@@ -662,11 +762,11 @@ class Application:
                 if area in AREAS_BY_ID and AREAS_BY_ID[area].city==f['region']:
                     if area in f['district_ids']:f['district_ids'].remove(area)
                     else:f['district_ids'].append(area)
-                    await self.db.save_filters(uid,kind,f)
+                    await self._save_filters(uid,kind,f)
                 await self.district_panel(uid,chat,kind,f);return
             if action=='district_clear':
                 f['district_ids']=[]
-                await self.db.save_filters(uid,kind,f)
+                await self._save_filters(uid,kind,f)
                 await self.district_panel(uid,chat,kind,f);return
             if action in ('price','area','loccustom','zone','deposit','dates'):
                 prompts={'price':'Введите цену от и до (THB): 10000 15000. Сброс: -',
@@ -682,7 +782,7 @@ class Application:
             if action=='reset':f=clean(DEFAULT)
             elif action=='copy':
                 other='latest' if kind=='search' else 'search'
-                await self.db.save_filters(uid,other,f)
+                await self._save_filters(uid,other,f)
             elif action=='room':
                 rows=[]
                 values=list(ROOM_TYPES.items())
@@ -703,12 +803,12 @@ class Application:
                 if key not in allowed:return
                 if key in f[which]:f[which].remove(key)
                 else:f[which].append(key)
-                await self.db.save_filters(uid,kind,f)
+                await self._save_filters(uid,kind,f)
                 await self.panel(uid,chat,'<b>Выберите удобства</b>\n✓ — фильтр включён.',choices_kb(kind,category,f,off));return
             elif action=='clear':f['amenities' if bits[3]=='amen' else 'facilities']=[]
             elif action=='setroom':f['room_type']=bits[3]
             elif action=='setsort':f['sort']=bits[3]
-            await self.db.save_filters(uid,kind,f)
+            await self._save_filters(uid,kind,f)
             await self.filters(uid,chat,kind)
 
         @r.message(F.text)
@@ -760,7 +860,7 @@ class Application:
                         zones=[x.strip() for x in raw.split(',')]
                         if not all(x.isdigit() for x in zones):raise ValueError('Нужны числовые ID зон через запятую')
                         f['zone_ids']=zones;f['project_id']=None
-                await self.db.save_filters(uid,kind,f)
+                await self._save_filters(uid,kind,f)
                 await self.safe_delete(m.chat.id,m.message_id)
                 await self.safe_delete(m.chat.id,prompt)
                 await self.filters(uid,m.chat.id,kind)
@@ -837,6 +937,7 @@ class Application:
     async def run(self):
         await self.db.init()
         self.task(self.background_sync());self.task(self.fx.loop())
+        self.task(self.collection_maintenance())
         try:
             await self.bot.delete_webhook(drop_pending_updates=False)
             await self.dp.start_polling(self.bot,handle_as_tasks=True)

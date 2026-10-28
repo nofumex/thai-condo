@@ -5,6 +5,7 @@ The unit's score falls continuously as publication age increases (even in Favori
 """
 from __future__ import annotations
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime,timezone
 from math import exp,log1p,sqrt
 from statistics import median
@@ -23,7 +24,14 @@ def age_days(x,now=None):
     try:return max(0.,(now-datetime.fromisoformat(str(x.get('createdAt')).replace('Z','+00:00'))).total_seconds()/86400)
     except (TypeError,ValueError):return 365.
 
-def comparables(rows:list[dict]):
+@dataclass(frozen=True)
+class ComparableSummary:
+    count:int
+    median_rent:float
+    median_sqm:float
+    def __len__(self):return self.count
+
+def comparables(rows:list[dict], summarize:bool=False):
     groups=defaultdict(list)
     for x in rows:
         rent=number(price_of(x));area=number((x.get('roomInformation') or {}).get('roomArea'))
@@ -32,6 +40,10 @@ def comparables(rows:list[dict]):
         room=(x.get('roomInformation') or {}).get('roomType')
         if rent and area and area>0:
             groups[(city_key,room)].append((rent,rent/area))
+    if summarize:
+        return {key:ComparableSummary(len(values),median(p for p,_ in values),
+                       median(area_price for _,area_price in values))
+                for key,values in groups.items()}
     return groups
 
 def _clamp(v):return max(0.,min(1.,v))
@@ -51,8 +63,11 @@ def score_parts(x:dict, groups:dict,now=None)->tuple[dict,float]:
     # Price and price/m² are rewarded independently but the two components are
     # kept under 33% total to prevent tiny cheaply priced studios from dominating.
     if len(same)>=5 and price and area and area>0:
-        median_rent=median(v[0] for v in same)
-        median_sqm=median(v[1] for v in same)
+        if isinstance(same,ComparableSummary):
+            median_rent,median_sqm=same.median_rent,same.median_sqm
+        else:
+            median_rent=median(v[0] for v in same)
+            median_sqm=median(v[1] for v in same)
         relative_price=_relative(price,median_rent)
         relative_area=_relative(price/area,median_sqm)
     else:

@@ -1,5 +1,6 @@
 """Durable SQLite state; only short async statements, WAL, no background locks in Telegram callbacks."""
 import json
+from .collections import signature, cache_expired
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import aiosqlite
@@ -29,6 +30,19 @@ class Database:
           created_at TEXT NOT NULL, PRIMARY KEY(user_id,listing_id));
         CREATE TABLE IF NOT EXISTS hidden(user_id INTEGER NOT NULL,listing_id TEXT NOT NULL,
           created_at TEXT NOT NULL, PRIMARY KEY(user_id,listing_id));
+        CREATE TABLE IF NOT EXISTS collection_cache (
+          user_id INTEGER PRIMARY KEY,
+          filter_signature TEXT NOT NULL,
+          status TEXT NOT NULL,
+          buckets_json TEXT NOT NULL DEFAULT '{}',
+          scanned_pages INTEGER NOT NULL DEFAULT 0,
+          candidates INTEGER NOT NULL DEFAULT 0,
+          skipped_corrupt INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          error TEXT,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
         CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         ''')
         # Safe migration for databases created by earlier bot versions.
@@ -57,10 +71,92 @@ class Database:
         if not row:return clean(DEFAULT)
         return clean(json.loads(row['latest_json' if kind=='latest' else 'search_json']))
     async def save_filters(self,uid,kind,f):
+        """Returns True only if normalized profile values actually changed.
+
+        Invalidation and profile update are atomic, so stale background jobs
+        cannot publish results for a different settings version.
+        """
         col='latest_json' if kind=='latest' else 'search_json'
+        norm=clean(f)
+        previous=await self.get_filters(uid,kind)
+        changed=norm!=previous
         await self.conn.execute(f'UPDATE users SET {col}=? WHERE id=?',
-                                (json.dumps(clean(f),ensure_ascii=False),uid))
+                                (json.dumps(norm,ensure_ascii=False),uid))
+        if kind=='latest' and changed:
+            sig=signature(norm)
+            await self.conn.execute('''INSERT INTO collection_cache
+              (user_id,filter_signature,status,buckets_json,updated_at,completed_at,error)
+              VALUES(?,?,'pending','{}',?,NULL,NULL)
+              ON CONFLICT(user_id) DO UPDATE SET
+                filter_signature=excluded.filter_signature,status='pending',
+                buckets_json='{}',scanned_pages=0,candidates=0,skipped_corrupt=0,
+                updated_at=excluded.updated_at,completed_at=NULL,error=NULL''',
+              (uid,sig,utc()))
         await self.conn.commit()
+        return changed
+
+    async def get_collection_cache(self,uid):
+        row=await self._one('SELECT * FROM collection_cache WHERE user_id=?',(uid,))
+        if not row:return None
+        cache=dict(row)
+        try:cache['buckets']=json.loads(cache['buckets_json'])
+        except (TypeError,ValueError):cache['buckets']={}
+        return cache
+
+    async def collection_needs_refresh(self,uid):
+        cache=await self.get_collection_cache(uid)
+        if not cache:return True
+        f=await self.get_filters(uid,'latest')
+        return (cache['filter_signature']!=signature(f) or
+                cache['status']!='ready' or cache_expired(cache))
+
+    async def active_collection_users(self,days=30,limit=200):
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
+        rows=await self._all('''SELECT u.id,u.latest_json,c.user_id AS cached
+                     FROM users u LEFT JOIN collection_cache c ON c.user_id=u.id
+                     WHERE u.last_seen>=? ORDER BY u.last_seen DESC LIMIT ?''',
+                     (cutoff,limit))
+        # Do not crawl 80 pages for every dormant/default user at first upgrade.
+        # Profiles changed by the user and users with previous cache are recovered.
+        return [r['id'] for r in rows if r['cached'] is not None or
+                clean(json.loads(r['latest_json']))!=clean(DEFAULT)]
+
+    async def begin_collection_build(self,uid,sig):
+        now=utc()
+        await self.conn.execute('''INSERT OR IGNORE INTO collection_cache
+          (user_id,filter_signature,status,updated_at) VALUES(?,?,'pending',?)''',
+          (uid,sig,now))
+        cursor=await self.conn.execute('''UPDATE collection_cache
+          SET status='building',scanned_pages=0,candidates=0,skipped_corrupt=0,
+              updated_at=?,error=NULL
+          WHERE user_id=? AND filter_signature=?''',(now,uid,sig))
+        await self.conn.commit()
+        return cursor.rowcount>0
+
+    async def collection_progress(self,uid,sig,pages,candidates,skipped):
+        await self.conn.execute('''UPDATE collection_cache SET
+          scanned_pages=?,candidates=?,skipped_corrupt=?,updated_at=?
+          WHERE user_id=? AND filter_signature=? AND status='building' ''',
+          (pages,candidates,skipped,utc(),uid,sig))
+        await self.conn.commit()
+
+    async def finish_collection_build(self,uid,sig,buckets,pages,candidates,skipped):
+        now=utc()
+        cursor=await self.conn.execute('''UPDATE collection_cache SET
+          status='ready',buckets_json=?,scanned_pages=?,candidates=?,
+          skipped_corrupt=?,updated_at=?,completed_at=?,error=NULL
+          WHERE user_id=? AND filter_signature=? AND status='building' ''',
+          (json.dumps(buckets,ensure_ascii=False),pages,candidates,skipped,
+           now,now,uid,sig))
+        await self.conn.commit()
+        return cursor.rowcount>0
+
+    async def fail_collection_build(self,uid,sig,error):
+        await self.conn.execute('''UPDATE collection_cache SET status='error',
+          error=?,updated_at=? WHERE user_id=? AND filter_signature=? AND status='building' ''',
+          (str(error)[:450],utc(),uid,sig))
+        await self.conn.commit()
+
     async def put_listings(self,items:list[dict]):
         now=utc()
         await self.conn.executemany('''INSERT INTO listings(id,json,created_at,refreshed_at,first_seen,last_seen)

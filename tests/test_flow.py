@@ -1,6 +1,7 @@
 """Offline async smoke tests for catalog pagination and empty-state cleanup."""
 import sys,types,unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import aiogram
@@ -115,35 +116,73 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(c.done)
         self.assertIsNotNone(c.message_id)
 
-    async def test_collection_is_ranked_once_before_first_card(self):
-        from unittest.mock import patch
-        import phbot.bot as module
+    async def test_collections_are_built_offline_and_open_without_http(self):
+        from phbot.collections import signature
+        from datetime import datetime, timezone
+        class CacheDB(FakeDB):
+            def __init__(self):
+                super().__init__()
+                self.filters=clean({})
+                self.cache=None
+            async def get_filters(self,uid,kind='latest'):return self.filters.copy()
+            async def get_collection_cache(self,uid):return self.cache
+            async def begin_collection_build(self,uid,sig):
+                self.cache={'filter_signature':sig,'status':'building',
+                            'buckets':{},'completed_at':None,'scanned_pages':0,'candidates':0}
+                return True
+            async def collection_progress(self,uid,sig,pages,candidates,skipped):
+                self.cache['scanned_pages']=pages
+                self.cache['candidates']=candidates
+            async def finish_collection_build(self,uid,sig,buckets,pages,candidates,skipped):
+                if self.cache['filter_signature']!=sig:return False
+                self.cache.update(status='ready',buckets=buckets,scanned_pages=pages,
+                                  candidates=candidates,completed_at=datetime.now(timezone.utc).isoformat())
+                return True
+            async def fail_collection_build(self,*args):raise AssertionError('Build must succeed')
         pages={i:[sample(i*10+j) for j in range(1,3)] for i in range(1,5)}
+        now=datetime.now(timezone.utc).isoformat()
         for page,items in pages.items():
             for item in items:
-                # A bargain on the final page should be considered against
-                # the whole pool, not ignored after 100 early candidates.
+                item['createdAt']=now
                 item['price']['forRent']['monthly']['price']=6000 if page==4 else 30000
         api=FakeAPI(pages)
-        class GuardedBot(FakeBot):
-            async def send_photo(self,*a,**k):
-                assert api.requests==[1,2,3,4], f'Premature card: {api.requests}'
-                return await super().send_photo(*a,**k)
+        db=CacheDB()
         app=Application.__new__(Application)
-        app.db=FakeDB();app.api=api
-        app.bot=GuardedBot();app.fx=SimpleNamespace(rate=None);app.photo_cache={}
-        c=Catalog(1,1,'collection','Collection',clean({}))
-        with patch.object(module,'COLLECTION_SCAN_PAGES',4):
-            await app._load(c)
-        self.assertTrue(c.done)
-        self.assertEqual(c.scanned_pages,4)
-        self.assertEqual(len(c.ids),8)
-        self.assertEqual(len(c.scores),8)
-        self.assertIn(c.ids[0],('41','42'))
-        first_order=list(c.ids)
-        await app._load(c)
+        app.db=db;app.api=api;app.bot=FakeBot()
+        app.fx=SimpleNamespace(rate=None);app.photo_cache={}
+        app.collection_semaphore=__import__('asyncio').Semaphore(1)
+        app.catalogs={}
+        with patch('phbot.bot.COLLECTION_SCAN_PAGES',4):
+            await app._prepare_collections(1,delay=0)
         self.assertEqual(api.requests,[1,2,3,4])
-        self.assertEqual(c.ids,first_order)
-        self.assertIsNotNone(c.message_id)
+        self.assertEqual(db.cache['status'],'ready')
+        self.assertEqual(set(db.cache['buckets']),{'1','7','20'})
+        self.assertEqual(len(db.cache['buckets']['7']),8)
+        self.assertIn(db.cache['buckets']['7'][0],('41','42'))
+        api.requests.clear()
+        await app.collection_from_cache(1,1,7)
+        self.assertEqual(api.requests,[], 'Tapping ready collection must never call PropertyHub')
+        self.assertIsNotNone(app.catalogs[1].message_id)
+        self.assertTrue(app.catalogs[1].done)
+
+    async def test_settings_change_only_triggers_permanent_collection_rebuild(self):
+        class FilterDB:
+            def __init__(self):self.state={'latest':clean({}),'search':clean({})}
+            async def save_filters(self,uid,kind,f):
+                current=clean(f)
+                changed=current!=self.state[kind]
+                self.state[kind]=current
+                return changed
+        app=Application.__new__(Application)
+        app.db=FilterDB()
+        calls=[]
+        app.schedule_collection=lambda uid,replace=False: calls.append((uid,replace))
+        await app._save_filters(1,'search',{'price_min':12000})
+        self.assertEqual(calls,[])
+        await app._save_filters(1,'latest',{'price_min':12000})
+        await app._save_filters(1,'latest',{'price_min':12000})
+        await app._save_filters(1,'latest',clean({}))
+        self.assertEqual(calls,[(1,True),(1,True)])
+
 
 if __name__=='__main__':unittest.main()
