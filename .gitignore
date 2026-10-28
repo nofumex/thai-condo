@@ -1,0 +1,74 @@
+﻿# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.json
+token.json
+*secret*.json
+*credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Databases and runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db3
+*.db3-*
+data/
+runtime/
+storage/
+sessions/
+session/
+cache/
+tmp/
+temp/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local backups and archives
+*.bak
+*.backup
+*.zip
+*.7z
+*.rar
