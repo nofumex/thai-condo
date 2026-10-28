@@ -1,3 +1,14 @@
+# Thai Condo v2.4 — UI-first, incremental collections, shared cache
+
+- **Search/New:** immediately send the first qualifying result instead of waiting for 12 results / 48 pages; continue searching in background. Remove loading message when first card appears.
+- **Collections screen:** back to just 1 / 7 / 30 days and Back. No build state, Settings, Menu, or other controls in the menu.
+- **Collection selection before ready:** only the selected period shows live progress and period-specific candidate counts. SQLite watcher automatically opens the list after the first 80 pages have been ranked.
+- **Quality:** the worker checkpoints every 5 pages, publishes ranked snapshots after 80,160,240,320,400,480 pages, and continues crawling even when no one views the section. Stops at end-of-catalog if sooner. Reuses the last checkpoint after restart.
+- **Resilience:** when API temporarily fails but a page was cached during the previous 24 hours, searches can fall back to saved data with a visible freshness warning; otherwise show an error.
+- **Shared provider cache:** query-level raw GraphQL page results (before local filtering), global listing store, deduplicated in-flight requests, TTL 25 minutes for interactive / 120 minutes for background, 24-hour housekeeping. Cached data remain available in SQLite after process restart.
+- **Safety:** old settings signatures cannot overwrite new collection results; old active list order is stable. Corrupt GraphQL Int entries still recover using subdivision; .env and SQLite are never distributed in the update archive.
+- **Tests:** 40 test cases (SQLite integration needs aiosqlite), search first-card timing, shared page reuse across deposit filters, concurrent same-page dedup, cancellation isolation, staged snapshot readiness, UI menu, DB schema and migration smoke.
+
 # Thai Condo v2.3 — фоновые готовые подборки (28.10.2026)
 
 - Перенесена загрузка 80 страниц из callback «Подборки» в фоновый воркер, запускающийся при сохранении **постоянных** настроек; разовый поисковый профиль не вызывает пересборку.

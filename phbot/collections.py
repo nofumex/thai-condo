@@ -1,6 +1,6 @@
 """Deterministic, cacheable ranking for precomputed collections.
 
-A single bounded provider scan prepares the 1/7/20-day buckets at once.
+Shared page cache supports successive stages of 1/7/30-day buckets.
 No provider requests are needed to open any of the buckets.
 """
 from __future__ import annotations
@@ -11,14 +11,16 @@ import json
 from .filters import clean
 from .ranking import age_days, comparables, score
 
-WINDOWS = (1, 7, 20)
+WINDOWS = (1, 7, 30)
 COLLECTION_CACHE_HOURS = 6
 COLLECTION_SCAN_PAGES = 80
+COLLECTION_MAX_PAGES = 480
+COLLECTION_PAGE_BATCH = 80
 COLLECTION_TARGET = 100
 
 
 def signature(filters: dict) -> str:
-    stable = json.dumps(clean(filters), ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    stable = json.dumps({'version': 4, 'filters': clean(filters)}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(stable.encode('utf-8')).hexdigest()
 
 

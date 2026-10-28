@@ -74,19 +74,45 @@ class FakeBot:
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_incremental_pagination_over_previous_limit(self):
         app=Application.__new__(Application)
-        app.db=FakeDB();app.api=FakeAPI({i:[sample(j) for j in range((i-1)*60+1,i*60+1)] for i in range(1,5)})
+        app.db=FakeDB();app.api=FakeAPI({i:[sample(j) for j in range((i-1)*60+1,i*60+1)] for i in range(1,13)})
         app.bot=FakeBot();app.fx=SimpleNamespace(rate=None);app.photo_cache={}
         c=Catalog(1,1,'search','Search',clean(DEFAULT))
         await app._load(c)
-        self.assertEqual(len(c.ids),60)
+        self.assertEqual(len(c.ids),480)
         self.assertFalse(c.done)
-        c.index=59;c.want_next=True
+        self.assertEqual(app.api.requests,list(range(1,9)))
+        c.index=479;c.want_next=True
         await app._load(c)
-        self.assertEqual(len(c.ids),120)
-        self.assertEqual(c.index,60)
-        await app._load(c)
-        self.assertEqual(len(c.ids),180)
-        self.assertEqual(app.api.requests,[1,2,3])
+        self.assertEqual(len(c.ids),540)
+        self.assertEqual(c.index,480)
+
+    async def test_first_card_before_second_page_completes(self):
+        """Do not wait for rare-filter page 48 or target 80 before UI."""
+        import asyncio
+        page2_entered=asyncio.Event()
+        release_page2=asyncio.Event()
+        class SlowAPI(FakeAPI):
+            async def search_page(self,f,page=1,per_page=60):
+                if page==2:
+                    page2_entered.set()
+                    await release_page2.wait()
+                return await super().search_page(f,page,per_page)
+        entry=sample(1)
+        entry['priceLandAndHouse']={'forRent':{'deposit':{'type':'MONTH','month':1}}}
+        app=Application.__new__(Application)
+        app.db=FakeDB();app.api=SlowAPI({1:[entry],2:[sample(2)]})
+        app.bot=FakeBot();app.fx=SimpleNamespace(rate=None);app.photo_cache={}
+        c=Catalog(1,1,'latest','Новые',clean({'deposit_max_months':1}))
+        work=asyncio.create_task(app._load(c))
+        try:
+            await asyncio.wait_for(page2_entered.wait(),2)
+            self.assertIsNotNone(c.message_id,'First listing must already be visible')
+            self.assertEqual(c.ids,['1'])
+            self.assertIn(c.progress_message,(None,))
+            self.assertIn(101,app.bot.deleted,'Loading message should be gone after first card')
+        finally:
+            release_page2.set()
+            await work
 
     async def test_no_results_message_is_removed(self):
         app=Application.__new__(Application)
@@ -126,13 +152,14 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 self.cache=None
             async def get_filters(self,uid,kind='latest'):return self.filters.copy()
             async def get_collection_cache(self,uid):return self.cache
-            async def begin_collection_build(self,uid,sig):
+            async def begin_collection_build(self,uid,sig,reset=False):
                 self.cache={'filter_signature':sig,'status':'building',
-                            'buckets':{},'completed_at':None,'scanned_pages':0,'candidates':0}
+                            'buckets':{},'completed_at':None,'scanned_pages':0,'candidates':0,'candidate_ids':[],'skipped_corrupt':0}
                 return True
-            async def collection_progress(self,uid,sig,pages,candidates,skipped):
+            async def collection_progress(self,uid,sig,pages,candidates,skipped,ids=None,window_counts=None):
                 self.cache['scanned_pages']=pages
                 self.cache['candidates']=candidates
+                if ids is not None:self.cache['candidate_ids']=list(ids)
             async def finish_collection_build(self,uid,sig,buckets,pages,candidates,skipped):
                 if self.cache['filter_signature']!=sig:return False
                 self.cache.update(status='ready',buckets=buckets,scanned_pages=pages,
@@ -151,12 +178,12 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         app.db=db;app.api=api;app.bot=FakeBot()
         app.fx=SimpleNamespace(rate=None);app.photo_cache={}
         app.collection_semaphore=__import__('asyncio').Semaphore(1)
-        app.catalogs={}
+        app.catalogs={};app.panel_kind={}
         with patch('phbot.bot.COLLECTION_SCAN_PAGES',4):
             await app._prepare_collections(1,delay=0)
         self.assertEqual(api.requests,[1,2,3,4])
         self.assertEqual(db.cache['status'],'ready')
-        self.assertEqual(set(db.cache['buckets']),{'1','7','20'})
+        self.assertEqual(set(db.cache['buckets']),{'1','7','30'})
         self.assertEqual(len(db.cache['buckets']['7']),8)
         self.assertIn(db.cache['buckets']['7'][0],('41','42'))
         api.requests.clear()

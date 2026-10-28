@@ -3,6 +3,8 @@ Never runs HTTP to PropertyHub inside navigation callbacks.
 """
 from __future__ import annotations
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass,field
 from datetime import datetime,timezone,timedelta
@@ -18,10 +20,10 @@ from aiogram.exceptions import TelegramBadRequest,TelegramForbiddenError
 from .config import Config
 from .db import Database
 from .propertyhub import PropertyHub,ProviderError,image_url,price_of,plain_html
-from .filters import DEFAULT,AMENITIES,FACILITIES,ROOM_TYPES,SORTS,clean,concise,matches_local
+from .filters import DEFAULT,AMENITIES,FACILITIES,ROOM_TYPES,SORTS,clean,concise,matches_local,attributes
 from .ranking import score,comparables,age_days
-from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_TARGET,
-                          signature, cache_expired, build_buckets)
+from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_MAX_PAGES, COLLECTION_PAGE_BATCH,
+                          COLLECTION_TARGET, signature, cache_expired, build_buckets)
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,card_text,card_kb,
@@ -33,7 +35,8 @@ log=logging.getLogger(__name__)
 # request must not synchronously crawl the entire provider catalog.
 SEARCH_STANDARD_PAGES = 8
 SEARCH_RARE_PAGES = 48
-SEARCH_RARE_TARGET = 12
+SEARCH_RARE_TARGET = 80
+COLLECTION_WAIT_POLL_SECONDS = 3
 
 
 @dataclass
@@ -65,6 +68,7 @@ class Catalog:
     want_next:bool=False
     scanned_pages:int=0
     skipped_corrupt:int=0
+    stale_pages:int=0
 
 class Application:
     def __init__(self,cfg:Config):
@@ -79,6 +83,8 @@ class Application:
         # concurrent 80-page scans from saturating the PropertyHub API.
         self.collection_tasks:dict[int,asyncio.Task]={}
         self.collection_semaphore=asyncio.Semaphore(1)
+        self.page_inflight:dict[tuple[str,int],asyncio.Task]={}
+        self.collection_wait_tasks:dict[int,asyncio.Task]={}
         self._setup_handlers()
 
     def task(self,coro):
@@ -132,17 +138,7 @@ class Application:
     async def filters(self,uid,chat,kind):
         self.panel_kind[uid]='filter:'+kind
         f=await self.db.get_filters(uid,kind)
-        text=filter_summary(kind,f)
-        if kind=='latest':
-            cache=await self.db.get_collection_cache(uid)
-            if cache and cache['filter_signature']==signature(f):
-                if cache['status'] in ('pending','building'):
-                    text+='\n\n<i>🏆 Подборки пересчитываются в фоне.</i>'
-                elif cache['status']=='ready':
-                    text+='\n\n<i>🏆 Подборки подготовлены.</i>'
-                elif cache['status']=='error':
-                    text+='\n\n<i>⚠️ Не удалось обновить подборки; повторите в разделе «Подборки».</i>'
-        await self.panel(uid,chat,text,filter_kb(kind,f))
+        await self.panel(uid,chat,filter_summary(kind,f),filter_kb(kind,f))
 
     async def district_panel(self,uid,chat,kind,f):
         prefix='f:'+('s' if kind=='search' else 'l')+':'
@@ -183,6 +179,8 @@ class Application:
         ranked_items=await self.db.listings_by_ids(c.ids[:800])
         current_score,_=score(item,comparables(ranked_items))
         text=card_text(item,favorite,current_score,self.fx.rate)
+        if c.stale_pages:
+            text+='\n<i>⚠️ Данные из кэша: актуальность уточняйте у владельца.</i>'
         markup=card_kb(item,index,len(c.ids),favorite,not c.done,c.provider_total if c.source!='collection' else None)
         photo=image_url(item.get('coverPicture'))
         cached_photo=self.photo_cache.get(str(item['id']))
@@ -217,12 +215,67 @@ class Application:
         c.message_id=m.message_id
         await self.db.metric(uid,'cards')
 
+    @staticmethod
+    def _server_cache_key(filters):
+        # Local-only filters (deposit, district, publication date, text)
+        # are deliberately excluded: identical upstream requests are reused.
+        contract={'v':1,'sort':filters.get('sort','CREATED_AT'),
+                  'region':filters.get('region',''), 'attributes':attributes(filters)}
+        raw=json.dumps(contract,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    async def _search_page(self,filters,page,cache_minutes=25):
+        """Provider page cached globally, then each user's local filters applied.
+
+        Concurrent requests for the same server query and page share one task.
+        User cancellation does not cancel a common fetch required by others.
+        """
+        if not (hasattr(self.db,'get_search_page') and hasattr(self.api,'search_page_unfiltered')):
+            reader=getattr(self.api,'search_page_resilient',self.api.search_page)
+            return await reader(filters,page=page,per_page=60)
+        key=self._server_cache_key(filters)
+        cache=await self.db.get_search_page(key,page,max_age_minutes=cache_minutes)
+        if cache is None:
+            flights=getattr(self,'page_inflight',None)
+            if flights is None:
+                flights={};self.page_inflight=flights
+            token=(key,page)
+            task=flights.get(token)
+            if task is None or task.done():
+                async def fetch():
+                    # Read again after queuing; a completed fetch may have stored it.
+                    value=await self.db.get_search_page(key,page,max_age_minutes=cache_minutes)
+                    if value is not None:return value
+                    raw,meta=await self.api.search_page_unfiltered(filters,page=page,per_page=60)
+                    await self.db.store_search_page(key,page,raw,meta)
+                    return raw,meta
+                task=asyncio.create_task(fetch())
+                flights[token]=task
+                def forget(done):
+                    if flights.get(token) is done:flights.pop(token,None)
+                    if not done.cancelled():
+                        try:done.result()
+                        except Exception:pass  # the awaiting request reports the error
+                task.add_done_callback(forget)
+            try:
+                cache=await asyncio.shield(task)
+            except (ProviderError,TimeoutError,OSError) as exc:
+                # Offline fallback only when a stored version exists; it is
+                # explicitly marked as stale in the listing caption.
+                cache=await self.db.get_search_page(key,page,max_age_minutes=24*60)
+                if cache is None:raise
+                old_rows,old_meta=cache
+                cache=old_rows,{**old_meta,'staleCache':True}
+                log.warning('PropertyHub unavailable; using cached page=%s: %s',page,exc)
+        raw,meta=cache
+        return [x for x in raw if matches_local(x,filters)],dict(meta)
+
     async def _provider_page(self,c:Catalog,page:int):
         """Read a page without discarding 59 good listings when one is broken."""
-        reader=getattr(self.api,'search_page_resilient',self.api.search_page)
-        rows,meta=await reader(c.filters,page=page,per_page=60)
+        rows,meta=await self._search_page(c.filters,page)
         c.scanned_pages+=1
         c.skipped_corrupt+=int(meta.get('skippedCorruptListings') or 0)
+        c.stale_pages+=bool(meta.get('staleCache'))
         c.provider_total=int(meta.get('totalCount') or c.provider_total or 0)
         c.total_pages=max(1,int(meta.get('totalPages') or c.total_pages or 1))
         c.next_page=page+1
@@ -252,241 +305,257 @@ class Application:
     async def ensure_collection(self,uid):
         """Queue stale/missing snapshots, never request PropertyHub in callbacks."""
         cache=await self.db.get_collection_cache(uid)
-        if cache and cache['status']=='error' and cache['filter_signature']==signature(
-                await self.db.get_filters(uid,'latest')):
-            return  # explicit retry, or maintenance after delay
         if await self.db.collection_needs_refresh(uid):
             self.schedule_collection(uid)
 
     async def _prepare_collections(self,uid,delay=1.0):
-        """One provider scan for three durable buckets, entirely off the UI path.
+        """Build a usable 80-page snapshot, then improve it up to 480 pages.
 
-        Cache writes are guarded by the settings signature. Cancellation or a
-        failed scan never publishes a partial sorted collection as ready.
+        Each stage releases the per-provider throttle so other users' setting
+        changes are not stuck behind one uninterrupted 480-page crawl.
         """
         sig=None
         try:
             if delay:await asyncio.sleep(delay)
-            async with self.collection_semaphore:
-                filters=await self.db.get_filters(uid,'latest')
-                sig=signature(filters)
-                cache=await self.db.get_collection_cache(uid)
-                if (cache and cache['filter_signature']==sig and cache['status']=='ready'
-                        and not cache_expired(cache)):
-                    return
-                if not await self.db.begin_collection_build(uid,sig):return
-                # Ranking overrides the UI sort; use latest first to increase
-                # the probability of covering all 1/7/20-day buckets.
-                scan_filter=dict(filters)
-                scan_filter['sort']='CREATED_AT'
-                seen=set();ids=[];pages=0;skipped=0;total_pages=COLLECTION_SCAN_PAGES
-                hidden=set(await self.db.listing_ids(uid,'hidden'))
-                reader=getattr(self.api,'search_page_resilient',self.api.search_page)
-                for page in range(1,COLLECTION_SCAN_PAGES+1):
-                    rows,meta=await reader(scan_filter,page=page,per_page=60)
-                    pages+=1
-                    skipped+=int(meta.get('skippedCorruptListings') or 0)
-                    total_pages=int(meta.get('totalPages') or total_pages)
-                    await self.db.put_listings(rows)
-                    for item in rows:
-                        ident=str(item.get('id') or '')
-                        if ident and ident not in seen and ident not in hidden:
-                            ids.append(ident);seen.add(ident)
-                    if pages%5==0 or page>=total_pages:
-                        await self.db.collection_progress(uid,sig,pages,len(ids),skipped)
-                    if page>=total_pages:break
-                    await asyncio.sleep(.15)
-                items=await self.db.listings_by_ids(ids)
-                # Heavy ranking runs in a thread, never blocks Telegram updates.
-                buckets=await asyncio.to_thread(build_buckets,items)
-                saved=await self.db.finish_collection_build(uid,sig,buckets,pages,len(items),skipped)
-                if saved:
-                    log.info('Cached 1/7/20-day collections: user=%s pages=%s candidates=%s sizes=%s',
-                             uid,pages,len(items),{k:len(v) for k,v in buckets.items()})
+            filters=await self.db.get_filters(uid,'latest')
+            sig=signature(filters)
+            cache=await self.db.get_collection_cache(uid)
+            if cache and cache['filter_signature']==sig:
+                ready=(cache.get('status')=='ready' and
+                       all(str(d) in (cache.get('buckets') or {}) for d in WINDOWS))
+                scanned=int(cache.get('scanned_pages') or 0)
+                if ready and scanned>=COLLECTION_MAX_PAGES and not cache_expired(cache):return
+                reset=ready and scanned>=COLLECTION_MAX_PAGES
+            else:
+                scanned=0;reset=False
+            if not await self.db.begin_collection_build(uid,sig,reset=reset):return
+            if reset:scanned=0
+            cache=await self.db.get_collection_cache(uid)
+            ids=list(cache.get('candidate_ids') or []) if not reset else []
+            seen=set(ids)
+            if cache.get('window_counts'):
+                counts={str(d):int(cache['window_counts'].get(str(d),0)) for d in WINDOWS}
+            else:
+                previous=await self.db.listings_by_ids(ids)
+                counts={str(d):sum(age_days(x)<=d for x in previous) for d in WINDOWS}
+            skipped=int(cache.get('skipped_corrupt') or 0) if not reset else 0
+            scan_filter=dict(filters);scan_filter['sort']='CREATED_AT'
+            hidden=set(await self.db.listing_ids(uid,'hidden'))
+            total_pages=COLLECTION_MAX_PAGES
+            max_pages=COLLECTION_MAX_PAGES
+            while scanned<min(max_pages,total_pages):
+                stage_end=min(((scanned//COLLECTION_PAGE_BATCH)+1)*COLLECTION_PAGE_BATCH,max_pages)
+                async with self.collection_semaphore:
+                    for page in range(scanned+1,stage_end+1):
+                        rows,meta=await self._search_page(scan_filter,page,cache_minutes=120)
+                        if not hasattr(self.db,'store_search_page'):
+                            await self.db.put_listings(rows)
+                        skipped+=int(meta.get('skippedCorruptListings') or 0)
+                        total_pages=int(meta.get('totalPages') or total_pages)
+                        for item in rows:
+                            ident=str(item.get('id') or '')
+                            if ident and ident not in seen and ident not in hidden:
+                                ids.append(ident);seen.add(ident)
+                                age=age_days(item)
+                                for days in WINDOWS:
+                                    if age<=days:counts[str(days)]+=1
+                        scanned=page
+                        if page%5==0 or page>=total_pages:
+                            await self.db.collection_progress(uid,sig,scanned,len(ids),skipped,ids,counts)
+                        if page>=total_pages:break
+                        await asyncio.sleep(.45)
+                    # No HTTP calls in ranking; still keep it outside Telegram UI.
+                    items=await self.db.listings_by_ids(ids)
+                    buckets=await asyncio.to_thread(build_buckets,items)
+                    if hasattr(self.db,'finish_collection_stage'):
+                        saved=await self.db.finish_collection_stage(uid,sig,buckets,scanned,ids,skipped,counts)
+                    else:
+                        saved=await self.db.finish_collection_build(uid,sig,buckets,scanned,len(ids),skipped)
+                    if not saved:return
+                    log.info('Collection milestone uid=%s pages=%s candidates=%s buckets=%s',
+                             uid,scanned,len(ids),{k:len(v) for k,v in buckets.items()})
+                # Yield to the next waiting user's 80-page stage.
+                await asyncio.sleep(.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning('Collection background build failed for user %s: %s',uid,e)
-            if sig is not None:
-                await self.db.fail_collection_build(uid,sig,e)
+            if sig is not None:await self.db.fail_collection_build(uid,sig,e)
 
     async def collections_panel(self,uid,chat):
-        """Status-only UI. Never start an 80-page scan inside this callback."""
+        """Original simple menu; never display crawler status here."""
         self.panel_kind[uid]='collections'
-        filters=await self.db.get_filters(uid,'latest')
-        sig=signature(filters)
-        cache=await self.db.get_collection_cache(uid)
-        if not cache or cache['filter_signature']!=sig:
-            text=('<b>🏆 Подборки</b>\n\n⏳ Подготавливаются в фоне по вашим настройкам. '
-                  'Пока расчёт не завершён, готовой подборки нет.\n\n'
-                  'Можно пользоваться другими разделами бота.')
-            available=False
-        else:
-            buckets=cache.get('buckets') or {}
-            available=all(str(d) in buckets for d in WINDOWS)
-            counts=' · '.join(f'{d} дн.: {len(buckets.get(str(d),[]))}' for d in WINDOWS)
-            lines=['<b>🏆 Подборки</b>']
-            if available:
-                lines.append('✅ Готовые списки: '+counts)
-                if cache.get('completed_at'):
-                    lines.append('🕒 Подготовлено: '+esc(cache['completed_at'][:16].replace('T',' ')+' UTC'))
-            status=cache['status']
-            if status in ('pending','building'):
-                lines.append(f'🔄 Пересборка в фоне · проверено {cache["scanned_pages"]} из {COLLECTION_SCAN_PAGES} страниц')
-            elif status=='error':
-                lines.append('⚠️ Последняя пересборка не завершилась: '+esc(str(cache.get('error') or '')[:150]))
-            elif status=='ready':
-                lines.append(f'📊 Проверено {cache["scanned_pages"]} страниц · кандидатов: {cache["candidates"]}')
-            lines.append('<i>Используются только постоянные «Настройки». '
-                         'Это рейтинги ограниченной выборки, не всего PropertyHub.</i>')
-            text='\n\n'.join(lines)
-        buttons=[]
-        if available:
-            buttons.append([b('📅 1 день','go:collection:1'),
-                            b('🗓 7 дней','go:collection:7'),
-                            b('📆 20 дней','go:collection:20')])
-        buttons.append([b('↻ Обновить статус','go:collections')])
-        if cache and cache['filter_signature']==sig and cache['status']=='error':
-            buttons.append([b('🔁 Повторить подготовку','go:collectionretry')])
-        buttons.append([b('⚙️ Настройки','filter:latest'),b('🏠 Меню','go:home')])
-        await self.panel(uid,chat,text,kb(buttons))
+        await self.panel(uid,chat,'<b>🏆 Подборки</b>\n\nВыберите период:',kb([
+            [b('📅 1 день','go:collection:1'),b('🗓 7 дней','go:collection:7'),
+             b('📆 30 дней','go:collection:30')],
+            [b('← Назад','go:home')]]))
+
+    async def _collection_wait(self,uid,chat,days,sig):
+        """Watch SQLite, not PropertyHub. Auto-open as soon as first batch is ready."""
+        last=None
+        try:
+            while self.panel_kind.get(uid)==f'collection-wait:{days}':
+                cache=await self.db.get_collection_cache(uid)
+                if cache and cache['filter_signature']==sig:
+                    buckets=cache.get('buckets') or {}
+                    if str(days) in buckets and cache.get('status')=='ready':
+                        await self.collections_panel(uid,chat)
+                        await self.collection_from_cache(uid,chat,days)
+                        return
+                    pages=int(cache.get('scanned_pages') or 0)
+                    candidates=int((cache.get('window_counts') or {}).get(str(days),cache.get('candidates') or 0))
+                    if cache.get('status')=='error':
+                        text=('<b>🏆 Подборка · '+str(days)+' дней</b>\n\n'
+                              '⚠️ Не удалось завершить подготовку. Попробуйте открыть подборку позже.')
+                        if text!=last:
+                            await self.panel(uid,chat,text,kb([[b('← Подборки','go:collections')]]))
+                        return
+                else:
+                    pages=candidates=0
+                text=(f'<b>🏆 Подборка · {days} дней</b>\n\n'
+                      f'🔄 Формируется подборка · проверено {pages} из {COLLECTION_SCAN_PAGES} страниц'
+                      f' · подходящих кандидатов: {candidates}\n\n'
+                      '<i>Можно вернуться в меню — подготовка продолжится в фоне.</i>')
+                if text!=last:
+                    await self.panel(uid,chat,text,kb([[b('← Подборки','go:collections')]]))
+                    last=text
+                await asyncio.sleep(COLLECTION_WAIT_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:log.exception('collection wait UI failed')
 
     async def collection_from_cache(self,uid,chat,days):
-        """Instant open from SQLite; never calls PropertyHub."""
+        """Never launches a provider scan from a Telegram callback."""
         if days not in WINDOWS:
             await self.collections_panel(uid,chat)
             return
         await self.close_catalog(uid)
         filters=await self.db.get_filters(uid,'latest')
         cache=await self.db.get_collection_cache(uid)
-        if not cache or cache['filter_signature']!=signature(filters) or str(days) not in cache.get('buckets',{}):
+        if (not cache or cache['filter_signature']!=signature(filters) or
+                str(days) not in (cache.get('buckets') or {})):
             await self.ensure_collection(uid)
-            await self.collections_panel(uid,chat)
+            self.panel_kind[uid]=f'collection-wait:{days}'
+            old=getattr(self,'collection_wait_tasks',{}).get(uid)
+            if old and not old.done():old.cancel()
+            if not hasattr(self,'collection_wait_tasks'):self.collection_wait_tasks={}
+            self.collection_wait_tasks[uid]=self.task(self._collection_wait(uid,chat,days,signature(filters)))
+            # First status appears immediately; no provider HTTP in callback.
             return
         ids=cache['buckets'][str(days)]
         hidden=set(await self.db.listing_ids(uid,'hidden'))
         data=await self.db.listings_by_ids(ids)
-        # An old snapshot must never show a listing that aged beyond the chosen
-        # window or no longer matches the latest settings.
-        allowed={str(item['id']) for item in data if age_days(item)<=days and matches_local(item,filters)}
+        allowed={str(item['id']) for item in data
+                 if age_days(item)<=days and matches_local(item,filters)}
         shown=[ident for ident in ids if ident in allowed and ident not in hidden]
         if not shown:
-            await self.panel(uid,chat,
-                f'<b>🏆 Подборка · {days} дней</b>\n\n'
-                'В подготовленном списке пока нет подходящих объявлений. '
-                'Новые варианты появятся после фонового обновления.',
-                kb([[b('← Подборки','go:collections')],[b('⚙️ Настройки','filter:latest')]]))
+            self.panel_kind[uid]='collection-empty'
+            await self.panel(uid,chat,f'<b>🏆 Подборка · {days} дней</b>\n\n'
+                'Пока нет подходящих объявлений. Подборка пополняется в фоне.',
+                kb([[b('← Подборки','go:collections')]]))
             return
         c=Catalog(chat,uid,'collection',f'Подборка за {days} дней',filters,ids=shown,done=True)
         self.catalogs[uid]=c
+        self.panel_kind[uid]='catalog'
         await self._send_card(c,0,replace=False)
 
     async def collection_maintenance(self):
-        """Recover pending builds on restart; refresh active users periodically."""
+        """Resume interrupted builds and periodically refresh active profiles."""
         while True:
             try:
                 for uid in await self.db.active_collection_users(days=30,limit=200):
                     if await self.db.collection_needs_refresh(uid):
                         self.schedule_collection(uid)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception('Collection maintenance')
+                if hasattr(self.db,'prune_search_pages'):
+                    await self.db.prune_search_pages(24)
+            except asyncio.CancelledError:raise
+            except Exception:log.exception('Collection maintenance')
             await asyncio.sleep(30*60)
 
     async def _load(self,c:Catalog):
-        """Page-by-page search, with deeper bounded bursts for rare local filters."""
+        """UI first: send the first matching card on the page that finds it.
+
+        Remaining pages continue in the same background worker. The progress
+        message exists ONLY while the catalog has no usable result.
+        """
         if c.done or c.load_lock.locked():return
         async with c.load_lock:
             gen=c.generation;uid=c.owner
             c.fetching=True
             progress=None
             try:
-                progress=await self.bot.send_message(c.chat_id,
-                    '🔎 <b>Загружаю объявления…</b>',parse_mode='HTML')
-                c.progress_message=progress.message_id
+                if not c.message_id and not c.ids:
+                    progress=await self.bot.send_message(c.chat_id,
+                        '🔎 <b>Ищу подходящие объявления…</b>',parse_mode='HTML')
+                    c.progress_message=progress.message_id
                 await self.db.metric(uid,'requests')
                 hidden=set(await self.db.listing_ids(uid,'hidden'))
                 have=set(c.ids)
-                # Scan until the next useful batch; local deposit/date/district
-                # filters can make some pages empty. A user may request more.
                 scanned=0
-                old_count=len(c.ids)
                 rare=bool(c.filters.get('deposit_max_months') is not None or
                           c.filters.get('district_ids') or c.filters.get('location_text') or
                           c.filters.get('date_from') or c.filters.get('date_to'))
                 page_budget=SEARCH_RARE_PAGES if rare else SEARCH_STANDARD_PAGES
-                target=SEARCH_RARE_TARGET if rare else 1
+                target=SEARCH_RARE_TARGET if rare else 480
+                # We can scan deeply, but never delay the first card to gather
+                # a target count. Every page can unlock a waiting Next press.
                 while gen==c.generation and scanned<page_budget and not c.done:
-                    page=c.next_page
-                    rows=await self._provider_page(c,page)
-                    await self.db.put_listings(rows)
+                    rows=await self._provider_page(c,c.next_page)
+                    if gen!=c.generation:return
+                    if not hasattr(self.db,'store_search_page'):
+                        await self.db.put_listings(rows)
                     scanned+=1
-                    for x in rows:
-                        ident=str(x.get('id') or '')
+                    for item in rows:
+                        ident=str(item.get('id') or '')
                         if ident and ident not in hidden and ident not in have:
                             c.ids.append(ident);have.add(ident)
-                    # With a 1-month deposit, even 8 pages can produce zero
-                    # matches; keep scanning automatically up to the bounded
-                    # budget instead of incorrectly declaring "nothing found".
-                    if len(c.ids)-old_count>=target:break
-                    if scanned%8==0 and progress:
-                        try:
-                            await self.bot.edit_message_text(
-                                f'🔎 <b>Загружаю объявления…</b>\n'
-                                f'Проверено {c.scanned_pages} стр. · найдено {len(c.ids)}',
-                                chat_id=c.chat_id,message_id=progress.message_id,parse_mode='HTML')
-                        except TelegramBadRequest:pass
-                    if not c.done:await asyncio.sleep(.15)
-
-                if gen!=c.generation:return
-                if c.ids and c.empty_message:
-                    await self.safe_delete(c.chat_id,c.empty_message)
-                    c.empty_message=None
-                if c.want_next and c.message_id and c.index+1<len(c.ids):
-                    c.want_next=False
-                    await self._send_card(c,c.index+1)
-                if c.ids and not c.message_id:
-                    if c.empty_message:
+                    if c.ids and c.empty_message:
                         await self.safe_delete(c.chat_id,c.empty_message)
                         c.empty_message=None
-                    await self._send_card(c,0,replace=False)
-                elif c.ids and c.message_id:
-                    x,_=await self.db.get_listing(c.ids[c.index])
-                    fav=await self.db.is_marked(uid,x['id'],'favorites')
-                    try:
-                        await self.bot.edit_message_reply_markup(
-                            chat_id=c.chat_id,message_id=c.message_id,
-                            reply_markup=card_kb(x,c.index,len(c.ids),fav,not c.done,
-                                c.provider_total if c.source!='collection' else None))
+                    if c.ids and not c.message_id:
+                        # FIRST MATCH: show immediately, never after 8/48 pages.
+                        await self._send_card(c,0,replace=False)
+                        if progress:
+                            await self.safe_delete(c.chat_id,progress.message_id)
+                            progress=None;c.progress_message=None
+                    if c.want_next and c.message_id and c.index+1<len(c.ids):
+                        c.want_next=False
+                        await self._send_card(c,c.index+1)
+                    if progress and scanned%8==0:
+                        try:
+                            await self.bot.edit_message_text(
+                                f'🔎 <b>Ищу подходящие объявления…</b>\n'
+                                f'Проверено {c.scanned_pages} стр. · найдено {len(c.ids)}',
+                                chat_id=c.chat_id,message_id=progress.message_id,
+                                parse_mode='HTML')
+                        except TelegramBadRequest:pass
+                    if len(c.ids)>=target:break
+                    if not c.done:await asyncio.sleep(.20)
+                if gen!=c.generation:return
+                if c.message_id and c.ids:
+                    item,_=await self.db.get_listing(c.ids[c.index])
+                    fav=await self.db.is_marked(uid,item['id'],'favorites')
+                    try:await self.bot.edit_message_reply_markup(
+                        chat_id=c.chat_id,message_id=c.message_id,
+                        reply_markup=card_kb(item,c.index,len(c.ids),fav,not c.done,c.provider_total))
                     except (TelegramBadRequest,TelegramForbiddenError):pass
-                    # A user at the last card asked for Next. If another full
-                    # bounded burst found nothing, explain it and offer a way
-                    # to keep scanning without silently ignoring the tap.
                     if c.want_next and c.index+1>=len(c.ids):
-                        if c.done:
-                            c.want_next=False
-                            text='Это последняя найденная квартира по текущим фильтрам.'
-                            buttons=[[b('🏠 Меню','go:home')]]
-                        else:
-                            text=(f'Проверено {c.scanned_pages} страниц. Новых совпадений пока нет. '
-                                  'Можно продолжить поиск.')
-                            buttons=[[b('🔎 Проверить дальше','card:more')],
-                                     [b('🏠 Меню','go:home')]]
+                        c.want_next=False
+                        text=('Это последняя подходящая квартира.' if c.done else
+                              f'Проверено {c.scanned_pages} страниц. Новых совпадений пока нет.')
+                        buttons=([[b('🔎 Проверить дальше','card:more')]] if not c.done else [])
+                        buttons.append([b('← Меню','go:home')])
                         m=await self.bot.send_message(c.chat_id,text,reply_markup=kb(buttons))
                         c.empty_message=m.message_id
                 else:
-                    text=(('По заданным фильтрам совпадений нет во всей доступной выдаче.' if c.scanned_pages>=c.total_pages else
-                           'По заданным фильтрам пока нет совпадений.') if c.done else
+                    text=('Совпадений во всей доступной выдаче нет.' if c.done else
                           f'Проверено {c.scanned_pages} страниц. Совпадений пока нет; можно искать дальше.')
-                    if c.skipped_corrupt:
-                        text+=f'\n⚠️ Пропущено некорректных записей PropertyHub: {c.skipped_corrupt}.' 
-                    buttons=[] if c.done else [[b('🔎 Проверить дальше','card:more')]]
-                    buttons += [[b('← Фильтры','filter:latest' if c.source in ('latest','collection') else 'filter:search')],
-                                [b('🏠 Меню','go:home')]]
+                    buttons=([[b('🔎 Проверить дальше','card:more')]] if not c.done else [])
+                    buttons.extend([[b('← Фильтры','filter:latest' if c.source=='latest' else 'filter:search')],
+                                    [b('🏠 Меню','go:home')]])
                     if c.empty_message:
                         try:await self.bot.edit_message_text(text,chat_id=c.chat_id,
-                                    message_id=c.empty_message,reply_markup=kb(buttons))
+                            message_id=c.empty_message,reply_markup=kb(buttons))
                         except TelegramBadRequest:pass
                     else:
                         m=await self.bot.send_message(c.chat_id,text,reply_markup=kb(buttons))
@@ -497,13 +566,11 @@ class Application:
                 log.warning('search error: %s',e)
                 msg='⚠️ Ошибка поиска: '+esc(str(e)[:280])
                 markup=kb([[b('↻ Повторить','card:more')],[b('🏠 Меню','go:home')]])
-                if c.empty_message:
-                    try:await self.bot.edit_message_text(msg,chat_id=c.chat_id,
-                           message_id=c.empty_message,parse_mode='HTML',reply_markup=markup)
-                    except TelegramBadRequest:pass
-                else:
+                if not c.message_id:
                     m=await self.bot.send_message(c.chat_id,msg,parse_mode='HTML',reply_markup=markup)
                     c.empty_message=m.message_id
+                else:
+                    log.warning('Search failed after showing first card; keeping catalog visible')
             finally:
                 c.fetching=False
                 if progress:
@@ -512,6 +579,7 @@ class Application:
 
     async def launch(self,uid,chat,kind,filters=None):
         await self.close_catalog(uid)
+        self.panel_kind[uid]='catalog'
         if kind in ('search','latest'):
             f=clean(filters if filters is not None else await self.db.get_filters(uid,kind))
             c=Catalog(chat,uid,kind,'Новые' if kind=='latest' else 'Поиск',f)
@@ -943,5 +1011,7 @@ class Application:
             await self.dp.start_polling(self.bot,handle_as_tasks=True)
         finally:
             for t in list(self.tasks):t.cancel()
-            if self.tasks:await asyncio.gather(*self.tasks,return_exceptions=True)
+            for t in list(self.page_inflight.values()):t.cancel()
+            pending=set(self.tasks)|set(self.page_inflight.values())
+            if pending:await asyncio.gather(*pending,return_exceptions=True)
             await self.api.close();await self.db.close();await self.bot.session.close()

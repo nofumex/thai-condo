@@ -125,7 +125,7 @@ class PropertyHub:
             self.region_zones[region]=zones
             return zones
 
-    async def search_page(self,filters:dict,page:int=1,per_page:int=60)->tuple[list[dict],dict]:
+    async def search_page(self,filters:dict,page:int=1,per_page:int=60,local_filter:bool=True)->tuple[list[dict],dict]:
         attrs=attributes(filters)
         if filters.get('region') and not attrs['zoneIds'] and not attrs.get('projectId'):
             attrs['zoneIds']=await self.resolve_region(filters['region'])
@@ -149,7 +149,7 @@ class PropertyHub:
                     if block.get('status')!='SUCCESS':raise ProviderError(str(block.get('error') or 'PropertyHub returned no SUCCESS'))
                     self.last_error=''
                     rows=block.get('result') or []
-                    return [x for x in rows if isinstance(x,dict) and matches_local(x,filters)],block.get('pagination') or {}
+                    return [x for x in rows if isinstance(x,dict) and (not local_filter or matches_local(x,filters))],block.get('pagination') or {}
                 except ProviderError as ex:
                     # GraphQL validation/serialization errors are deterministic
                     # for this particular request; retrying it cannot help and
@@ -162,7 +162,7 @@ class PropertyHub:
             self.last_error=str(last)
             raise ProviderError(f'PropertyHub: {last}')
 
-    async def search_page_resilient(self, filters:dict, page:int=1, per_page:int=60)->tuple[list[dict],dict]:
+    async def search_page_resilient(self, filters:dict, page:int=1, per_page:int=60, local_filter:bool=True)->tuple[list[dict],dict]:
         """Return a page even when one provider listing has invalid GraphQL Int fields.
 
         Split a failing page into *aligned, non-overlapping* smaller pages using
@@ -179,7 +179,7 @@ class PropertyHub:
             # Every recursive child must have the same absolute starting offset.
             assert offset%size==0
             try:
-                rows,meta=await self.search_page(filters,page=offset//size+1,per_page=size)
+                rows,meta=await self.search_page(filters,page=offset//size+1,per_page=size,local_filter=local_filter)
                 return rows,meta,0
             except ProviderError as exc:
                 if GRAPHQL_INT_SERIALIZATION_ERROR not in str(exc):
@@ -217,6 +217,10 @@ class PropertyHub:
             # pagination totalPages into the parent 60-item cursor.
             meta['totalPages']=ceil(int(meta['totalCount'])/per_page)
         return rows,meta
+
+    async def search_page_unfiltered(self, filters:dict, page:int=1, per_page:int=60):
+        """Unfiltered provider results for the shared cache, with corrupt-row recovery."""
+        return await self.search_page_resilient(filters,page,per_page,local_filter=False)
 
     async def details(self,x:dict)->dict:
         """Confirmed live endpoint: /_next/data/<buildId>/en/listings/<slug>---<id>.json.

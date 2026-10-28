@@ -18,11 +18,10 @@ class CacheTests(unittest.TestCase):
     def test_one_scan_produces_all_windows_and_expiration_cutoffs(self):
         data=[item(1,.25),item(2,4),item(3,15),item(4,25)]
         buckets=build_buckets(data,NOW)
-        self.assertEqual(set(buckets),{'1','7','20'})
+        self.assertEqual(set(buckets),{'1','7','30'})
         self.assertEqual(set(buckets['1']),{'1'})
         self.assertEqual(set(buckets['7']),{'1','2'})
-        self.assertEqual(set(buckets['20']),{'1','2','3'})
-        self.assertNotIn('4',buckets['20'])
+        self.assertEqual(set(buckets['30']),{'1','2','3','4'})
 
     def test_permanent_settings_signature_is_canonical(self):
         self.assertEqual(signature({'region':'bangkok','price_min':12000}),
