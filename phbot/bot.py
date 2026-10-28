@@ -8,6 +8,7 @@ from dataclasses import dataclass,field
 from datetime import datetime,timezone,timedelta
 from html import escape
 from statistics import mean
+from math import isfinite
 from collections import defaultdict
 from typing import Optional
 from aiogram import Bot,Dispatcher,F,Router
@@ -24,6 +25,16 @@ from .fx import FX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
 log=logging.getLogger(__name__)
+
+# Bounded incremental sampling: a rare local filter (deposit / date / areas)
+# deserves substantially deeper initial scanning, but an interactive Telegram
+# request must not synchronously crawl the entire provider catalog.
+SEARCH_STANDARD_PAGES = 8
+SEARCH_RARE_PAGES = 48
+SEARCH_RARE_TARGET = 12
+COLLECTION_SCAN_PAGES = 80
+COLLECTION_TARGET = 100
+
 
 @dataclass
 class Catalog:
@@ -52,6 +63,8 @@ class Catalog:
     progress_message:Optional[int]=None
     load_lock:asyncio.Lock=field(default_factory=asyncio.Lock)
     want_next:bool=False
+    scanned_pages:int=0
+    skipped_corrupt:int=0
 
 class Application:
     def __init__(self,cfg:Config):
@@ -190,10 +203,97 @@ class Application:
         c.message_id=m.message_id
         await self.db.metric(uid,'cards')
 
-    async def _load(self,c:Catalog):
-        """Cursor-driven search. No 100-item cap; later pages load on demand.
-        An empty intermediate page must never be reported as global no-results.
+    async def _provider_page(self,c:Catalog,page:int):
+        """Read a page without discarding 59 good listings when one is broken."""
+        reader=getattr(self.api,'search_page_resilient',self.api.search_page)
+        rows,meta=await reader(c.filters,page=page,per_page=60)
+        c.scanned_pages+=1
+        c.skipped_corrupt+=int(meta.get('skippedCorruptListings') or 0)
+        c.provider_total=int(meta.get('totalCount') or c.provider_total or 0)
+        c.total_pages=max(1,int(meta.get('totalPages') or c.total_pages or 1))
+        c.next_page=page+1
+        if c.next_page>c.total_pages:c.done=True
+        return rows
+
+    async def _load_collection(self,c:Catalog):
+        """Fully prepare a bounded comparison pool BEFORE showing its first card.
+
+        No page-by-page reranking: the order is frozen until a new collection
+        launch. The displayed score itself can still age while in Favorites.
         """
+        if c.done or c.load_lock.locked():return
+        async with c.load_lock:
+            gen=c.generation;uid=c.owner
+            c.fetching=True
+            progress=None
+            selected=[];known=set()
+            hidden=set(await self.db.listing_ids(uid,'hidden'))
+            try:
+                progress=await self.bot.send_message(c.chat_id,
+                    '🏆 <b>Формирую подборку…</b>\n'
+                    'Сначала собираю кандидатов и рассчитываю рейтинг, затем открою готовый список.',
+                    parse_mode='HTML')
+                c.progress_message=progress.message_id
+                await self.db.metric(uid,'requests')
+                while c.generation==gen and not c.done and c.scanned_pages<COLLECTION_SCAN_PAGES:
+                    page=c.next_page
+                    rows=await self._provider_page(c,page)
+                    await self.db.put_listings(rows)
+                    for item in rows:
+                        key=str(item.get('id') or '')
+                        if key and key not in known and key not in hidden:
+                            known.add(key);selected.append(key)
+                    if c.scanned_pages%8==0 and progress:
+                        try:
+                            await self.bot.edit_message_text(
+                                f'🏆 <b>Формирую подборку…</b>\n'
+                                f'Проверено страниц: {c.scanned_pages} / {COLLECTION_SCAN_PAGES} · кандидатов: {len(selected)}',
+                                chat_id=c.chat_id,message_id=progress.message_id,parse_mode='HTML')
+                        except TelegramBadRequest:pass
+                    if not c.done:await asyncio.sleep(.15)
+                if gen!=c.generation:return
+                c.done=True
+                if selected:
+                    items=await self.db.listings_by_ids(selected)
+                    # One comparison set, one definitive ranking, one counter.
+                    groups=comparables(items)
+                    ranked=sorted(((score(item,groups)[0],str(item['id'])) for item in items),
+                                  key=lambda x:(-x[0],x[1]))
+                    winners=ranked[:COLLECTION_TARGET]
+                    c.ids=[ident for _,ident in winners]
+                    c.scores=dict((ident,value) for value,ident in winners)
+                    await self._send_card(c,0,replace=False)
+                else:
+                    suffix=' по всей выдаче' if c.next_page>c.total_pages else f' на первых {c.scanned_pages} страницах'
+                    text=('Подходящих квартир не найдено'+suffix+'.\n'
+                          'Это не означает, что вариантов нет в остальном каталоге PropertyHub.')
+                    m=await self.bot.send_message(c.chat_id,text,reply_markup=kb([
+                        [b('⚙️ Настройки','filter:latest')],[b('🏠 Меню','go:home')]]))
+                    c.empty_message=m.message_id
+                if c.scanned_pages>=COLLECTION_SCAN_PAGES and c.next_page<=c.total_pages:
+                    log.info('Collection scanned first %s pages, ranked %s candidates (bounded sample)',
+                             c.scanned_pages,len(selected))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning('collection error: %s',exc)
+                if gen==c.generation:
+                    m=await self.bot.send_message(c.chat_id,
+                        '⚠️ Не удалось закончить подборку: '+esc(str(exc)[:220]),
+                        parse_mode='HTML',reply_markup=kb([[b('↻ Повторить','go:collections')],
+                                                           [b('🏠 Меню','go:home')]]))
+                    c.empty_message=m.message_id
+            finally:
+                c.fetching=False
+                if progress:
+                    await self.safe_delete(c.chat_id,progress.message_id)
+                    if c.progress_message==progress.message_id:c.progress_message=None
+
+    async def _load(self,c:Catalog):
+        """Page-by-page search, with deeper bounded bursts for rare local filters."""
+        if c.source=='collection':
+            await self._load_collection(c)
+            return
         if c.done or c.load_lock.locked():return
         async with c.load_lock:
             gen=c.generation;uid=c.owner
@@ -210,31 +310,31 @@ class Application:
                 # filters can make some pages empty. A user may request more.
                 scanned=0
                 old_count=len(c.ids)
-                while gen==c.generation and scanned<8 and not c.done:
+                rare=bool(c.filters.get('deposit_max_months') is not None or
+                          c.filters.get('district_ids') or c.filters.get('location_text') or
+                          c.filters.get('date_from') or c.filters.get('date_to'))
+                page_budget=SEARCH_RARE_PAGES if rare else SEARCH_STANDARD_PAGES
+                target=SEARCH_RARE_TARGET if rare else 1
+                while gen==c.generation and scanned<page_budget and not c.done:
                     page=c.next_page
-                    rows,pag=await self.api.search_page(c.filters,page=page,per_page=60)
+                    rows=await self._provider_page(c,page)
                     await self.db.put_listings(rows)
-                    c.provider_total=int(pag.get('totalCount') or c.provider_total or 0)
-                    c.total_pages=max(1,int(pag.get('totalPages') or 1))
-                    c.next_page=page+1
                     scanned+=1
                     for x in rows:
                         ident=str(x.get('id') or '')
                         if ident and ident not in hidden and ident not in have:
                             c.ids.append(ident);have.add(ident)
-                    if c.next_page>c.total_pages:c.done=True
-                    if c.source=='collection' and c.ids:
-                        items=await self.db.listings_by_ids(c.ids)
-                        groups=comparables(items)
-                        # Rank the current fetched sample, not stale unrelated
-                        # listings from previous searches/settings.
-                        active=c.ids[c.index] if c.message_id and c.ids else None
-                        ranked=sorted(items,key=lambda x:score(x,groups)[0],reverse=True)
-                        c.ids=[str(x['id']) for x in ranked]
-                        if active in c.ids:c.index=c.ids.index(active)
-                    # First card after first matching page. On a subsequent
-                    # load, stop after collecting roughly one extra page.
-                    if len(c.ids)>old_count and (not c.message_id or len(c.ids)-old_count>=40):break
+                    # With a 1-month deposit, even 8 pages can produce zero
+                    # matches; keep scanning automatically up to the bounded
+                    # budget instead of incorrectly declaring "nothing found".
+                    if len(c.ids)-old_count>=target:break
+                    if scanned%8==0 and progress:
+                        try:
+                            await self.bot.edit_message_text(
+                                f'🔎 <b>Загружаю объявления…</b>\n'
+                                f'Проверено {c.scanned_pages} стр. · найдено {len(c.ids)}',
+                                chat_id=c.chat_id,message_id=progress.message_id,parse_mode='HTML')
+                        except TelegramBadRequest:pass
                     if not c.done:await asyncio.sleep(.15)
 
                 if gen!=c.generation:return
@@ -258,9 +358,27 @@ class Application:
                             reply_markup=card_kb(x,c.index,len(c.ids),fav,not c.done,
                                 c.provider_total if c.source!='collection' else None))
                     except (TelegramBadRequest,TelegramForbiddenError):pass
+                    # A user at the last card asked for Next. If another full
+                    # bounded burst found nothing, explain it and offer a way
+                    # to keep scanning without silently ignoring the tap.
+                    if c.want_next and c.index+1>=len(c.ids):
+                        if c.done:
+                            c.want_next=False
+                            text='Это последняя найденная квартира по текущим фильтрам.'
+                            buttons=[[b('🏠 Меню','go:home')]]
+                        else:
+                            text=(f'Проверено {c.scanned_pages} страниц. Новых совпадений пока нет. '
+                                  'Можно продолжить поиск.')
+                            buttons=[[b('🔎 Проверить дальше','card:more')],
+                                     [b('🏠 Меню','go:home')]]
+                        m=await self.bot.send_message(c.chat_id,text,reply_markup=kb(buttons))
+                        c.empty_message=m.message_id
                 else:
-                    text=('Ничего не найдено по заданным фильтрам.' if c.done else
-                          f'Пока нет совпадений на первых {c.next_page-1} страницах. Можно проверить следующие.')
+                    text=(('По заданным фильтрам совпадений нет во всей доступной выдаче.' if c.scanned_pages>=c.total_pages else
+                           'По заданным фильтрам пока нет совпадений.') if c.done else
+                          f'Проверено {c.scanned_pages} страниц. Совпадений пока нет; можно искать дальше.')
+                    if c.skipped_corrupt:
+                        text+=f'\n⚠️ Пропущено некорректных записей PropertyHub: {c.skipped_corrupt}.' 
                     buttons=[] if c.done else [[b('🔎 Проверить дальше','card:more')]]
                     buttons += [[b('← Фильтры','filter:latest' if c.source in ('latest','collection') else 'filter:search')],
                                 [b('🏠 Меню','go:home')]]
@@ -608,14 +726,19 @@ class Application:
                         parts=raw.replace(',','.').split()
                         if len(parts)!=2:raise ValueError('Введите два числа через пробел')
                         nums=[float(x) for x in parts]
-                        if any(x<0 for x in nums) or nums[0]>nums[1]:raise ValueError('Некорректный диапазон')
-                        if field=='price':f['price_min'],f['price_max']=int(nums[0]),int(nums[1])
+                        if any(not isfinite(x) or x<0 for x in nums) or nums[0]>nums[1]:
+                            raise ValueError('Некорректный диапазон')
+                        if field=='price':
+                            from .propertyhub import GRAPHQL_INT_MAX
+                            if nums[1]>GRAPHQL_INT_MAX:
+                                raise ValueError(f'Цена не может превышать {GRAPHQL_INT_MAX:,} ฿ (лимит GraphQL Int)')
+                            f['price_min'],f['price_max']=int(nums[0]),int(nums[1])
                         else:f['area_min'],f['area_max']=nums
                 elif field=='deposit':
                     if raw=='-':f['deposit_max_months']=None
                     else:
                         n=float(raw.replace(',','.'))
-                        if n<0 or n>12:raise ValueError('Допустимо от 0 до 12 месяцев')
+                        if not isfinite(n) or n<0 or n>12:raise ValueError('Допустимо от 0 до 12 месяцев')
                         f['deposit_max_months']=n
                 elif field=='dates':
                     if raw=='-':f['date_from']=f['date_to']=None

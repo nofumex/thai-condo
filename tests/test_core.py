@@ -26,6 +26,15 @@ class FiltersTest(unittest.TestCase):
         self.assertEqual(a['projectId'],'3212')
         self.assertEqual(a['zoneIds'],['123'])
         self.assertEqual(a['roomInformation']['roomArea'],{'min':25,'max':35})
+    def test_graphql_int_limits_and_nonfinite_values(self):
+        f=clean({'price_max':3_000_000_000,'price_min':3_000_000_000,
+                 'area_max':float('inf'),'deposit_max_months':float('nan')})
+        a=attributes(f)
+        self.assertLessEqual(a['price']['max'],2_147_483_647)
+        self.assertLessEqual(a['price']['min'],2_147_483_647)
+        self.assertIsNone(f['area_max'])
+        self.assertIsNone(f['deposit_max_months'])
+
     def test_local_filter(self):
         self.assertTrue(matches_local(listing(1),{'location_text':'bang na'}))
         self.assertFalse(matches_local(listing(1),{'location_text':'phuket'}))
@@ -108,6 +117,72 @@ class APIAsyncTest(unittest.IsolatedAsyncioTestCase):
         try:
             await api.search_page(clean({'region':'phuket'}))
             self.assertEqual(requests[0]['zoneIds'],['12345'])
+        finally:await api.close()
+
+class ResilientPaginationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_bad_graphql_int_record_only_is_skipped(self):
+        """Regression: Bangkok CREATED_AT page 12/60 failed at page 35/20."""
+        requests=[]
+        bad_offset=690  # a single record in the 680..699 region
+        total=153623
+        def handle(req):
+            payload=json.loads(req.content)
+            v=payload['variables'];n=v['perPage'];page=v['page']
+            start=(page-1)*n
+            requests.append((start,n))
+            if start<=bad_offset<start+n:
+                return httpx.Response(200,json={'errors':[
+                    {'message':'Int cannot represent non 32-bit signed integer value: 3000000000'}]})
+            result=[listing(i) for i in range(start,start+n)]
+            return httpx.Response(200,json={'data':{'zoneListings':{
+                'status':'SUCCESS',
+                'pagination':{'totalPages':(total+n-1)//n,'totalCount':total},
+                'result':result}}})
+        api=PropertyHub(transport=httpx.MockTransport(handle))
+        try:
+            f=clean({})
+            rows,meta=await api.search_page_resilient(f,page=12,per_page=60)
+            ids={int(x['id']) for x in rows}
+            self.assertEqual(len(rows),59)
+            self.assertNotIn(bad_offset,ids)
+            self.assertEqual(ids,set(range(660,720))-{bad_offset})
+            self.assertEqual(meta['skippedCorruptListings'],1)
+            self.assertEqual(meta['totalPages'],(total+59)//60)
+            self.assertIn((660,60),requests)
+            self.assertIn((680,20),requests)
+            self.assertIn((690,1),requests)
+            # A following page works normally without stale state.
+            next_rows,_=await api.search_page_resilient(f,page=13,per_page=60)
+            self.assertEqual(len(next_rows),60)
+            self.assertEqual(int(next_rows[0]['id']),720)
+        finally:await api.close()
+
+    async def test_unrelated_provider_errors_are_not_silently_skipped(self):
+        from phbot.propertyhub import ProviderError
+        called=[]
+        def handle(req):
+            called.append(1)
+            return httpx.Response(200,json={'errors':[{'message':'Permission denied'}]})
+        api=PropertyHub(transport=httpx.MockTransport(handle))
+        try:
+            with self.assertRaisesRegex(ProviderError,'Permission denied'):
+                await api.search_page_resilient(clean({}),page=2,per_page=60)
+            self.assertEqual(len(called),1)
+        finally:await api.close()
+
+    async def test_valid_page_no_extra_requests(self):
+        called=[]
+        def handle(req):
+            called.append(1)
+            return httpx.Response(200,json={'data':{'zoneListings':{
+                'status':'SUCCESS','pagination':{'totalPages':5,'totalCount':300},
+                'result':[listing(i) for i in range(60)]}}})
+        api=PropertyHub(transport=httpx.MockTransport(handle))
+        try:
+            rows,meta=await api.search_page_resilient(clean({}))
+            self.assertEqual(len(rows),60)
+            self.assertEqual(len(called),1)
+            self.assertEqual(meta['totalPages'],5)
         finally:await api.close()
 
 class ExtendedFiltersTest(unittest.TestCase):

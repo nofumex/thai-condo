@@ -4,6 +4,7 @@ Additional constraints are checked locally against full search result summaries.
 from __future__ import annotations
 from copy import deepcopy
 from datetime import date, datetime, timezone
+from math import isfinite
 from .geography import CITIES, AREAS_BY_ID, city_of, district_of
 
 AMENITIES = {
@@ -62,7 +63,18 @@ def clean(raw:dict|None)->dict:
         try:
             v=out[k]
             out[k]=float(v) if v is not None and v!='' else None
-            if out[k] is not None and (out[k]<0 or out[k]>1e9):out[k]=None
+            if out[k] is not None:
+                # Never serialize NaN/Infinity or any negative GraphQL bounds.
+                if not isfinite(out[k]) or out[k]<0:
+                    out[k]=None
+                elif k in ('price_min','price_max'):
+                    out[k]=min(out[k],2_147_483_647)
+                elif k in ('area_min','area_max'):
+                    out[k]=min(out[k],1_000_000)
+                elif k=='deposit_max_months':
+                    out[k]=min(out[k],12)
+                elif k=='project_id' and out[k]>1_000_000_000:
+                    out[k]=None
             if k in ('price_min','price_max','project_id') and out[k] is not None:out[k]=int(out[k])
         except (ValueError,TypeError,OverflowError):out[k]=None
     for a,b in [('price_min','price_max'),('area_min','area_max')]:

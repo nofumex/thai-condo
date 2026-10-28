@@ -1,4 +1,4 @@
-﻿# Secrets and local configuration
+# Credentials and deployment-only settings
 .env
 .env.*
 !.env.example
@@ -13,62 +13,47 @@ token.json
 *secret*.json
 *credentials*.json
 
-# Python
+# Python runtime, builds, test caches
 __pycache__/
 *.py[cod]
-*.pyo
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.tox/
-.nox/
 .coverage
 htmlcov/
-*.egg-info/
 build/
 dist/
 .venv/
 venv/
 env/
-ENV/
-.python-version
 
-# Databases and runtime state
-*.db
-*.db-*
+# Private state (favorites, local listing index and cached details)
+data/
 *.sqlite
 *.sqlite3
 *.sqlite3-*
+*.db
+*.db-*
 *.db3
 *.db3-*
-data/
-runtime/
-storage/
-sessions/
-session/
-cache/
+
+# Ephemeral files and logs
+logs/
+*.log
+*.log.*
 tmp/
 temp/
-
-# Logs
-*.log
-logs/
-*.log.*
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Local backups and archives
+cache/
 *.bak
 *.backup
 *.zip
 *.7z
 *.rar
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

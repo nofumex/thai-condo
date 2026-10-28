@@ -1,5 +1,6 @@
 """HTTP-only PropertyHub adapter. No Playwright or AI required."""
 import asyncio
+from math import ceil
 import json
 import logging
 import re
@@ -21,6 +22,11 @@ BUILD_RE=re.compile(r'propertyhub-web-[a-f0-9]{32,64}')
 NEXT_RE=re.compile(r'<script\b[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',re.S|re.I)
 
 class ProviderError(RuntimeError):pass
+
+# PropertyHub's GraphQL response contains some listings whose fields exceed
+# GraphQL Int's 32-bit range.  Recover only this known provider-data error.
+GRAPHQL_INT_SERIALIZATION_ERROR = 'Int cannot represent non 32-bit signed integer value'
+GRAPHQL_INT_MAX = 2_147_483_647
 
 def listing_url(x:dict)->str:
     slug=x.get('slug') or ''
@@ -144,11 +150,73 @@ class PropertyHub:
                     self.last_error=''
                     rows=block.get('result') or []
                     return [x for x in rows if isinstance(x,dict) and matches_local(x,filters)],block.get('pagination') or {}
-                except (httpx.HTTPError,ValueError,ProviderError) as ex:
+                except ProviderError as ex:
+                    # GraphQL validation/serialization errors are deterministic
+                    # for this particular request; retrying it cannot help and
+                    # makes recursive recovery unnecessarily expensive.
+                    self.last_error=str(ex)
+                    raise ProviderError(f'PropertyHub: {ex}') from ex
+                except (httpx.HTTPError,ValueError) as ex:
                     last=ex
-                    if attempt<2 and not isinstance(ex,ProviderError):await asyncio.sleep(0.5*(attempt+1))
+                    if attempt<2:await asyncio.sleep(0.5*(attempt+1))
             self.last_error=str(last)
             raise ProviderError(f'PropertyHub: {last}')
+
+    async def search_page_resilient(self, filters:dict, page:int=1, per_page:int=60)->tuple[list[dict],dict]:
+        """Return a page even when one provider listing has invalid GraphQL Int fields.
+
+        Split a failing page into *aligned, non-overlapping* smaller pages using
+        the exact same order/filters.  Only an irrecoverable single listing is
+        omitted.  All other errors (auth, rate limits, network) propagate.
+        """
+        if not isinstance(page,int) or page<1 or isinstance(page,bool):
+            raise ValueError('GraphQL page must be a positive integer')
+        if not isinstance(per_page,int) or not (1<=per_page<=60) or isinstance(per_page,bool):
+            raise ValueError('GraphQL per_page must be 1..60')
+        start=(page-1)*per_page
+
+        async def collect(offset:int,size:int):
+            # Every recursive child must have the same absolute starting offset.
+            assert offset%size==0
+            try:
+                rows,meta=await self.search_page(filters,page=offset//size+1,per_page=size)
+                return rows,meta,0
+            except ProviderError as exc:
+                if GRAPHQL_INT_SERIALIZATION_ERROR not in str(exc):
+                    raise
+                if size==1:
+                    log.warning('PropertyHub invalid listing at offset %d (skipped): %s',offset,exc)
+                    return [],{},1
+                child_size=next((n for n in (20,10,5,1) if n<size and size%n==0),1)
+                if size%child_size:
+                    # This never happens with 60, 20, 10 or 5; for arbitrary
+                    # per_page values, 1 is always a safe aligned divisor.
+                    child_size=1
+                log.warning('PropertyHub bad GraphQL Int at offset %d, size %d: retrying in chunks of %d',
+                            offset,size,child_size)
+                items=[];usable_meta={};bad=0
+                for child_offset in range(offset,offset+size,child_size):
+                    chunk,meta,skipped=await collect(child_offset,child_size)
+                    items.extend(chunk)
+                    if meta and not usable_meta:usable_meta=meta
+                    bad+=skipped
+                return items,usable_meta,bad
+
+        rows,meta,skipped=await collect(start,per_page)
+        if not meta:
+            # Do not report a totally broken page as an empty/full catalog.
+            raise ProviderError(f'PropertyHub: no healthy listing or pagination metadata '
+                                f'could be recovered from page {page}')
+        meta=dict(meta or {})
+        if skipped:
+            meta['skippedCorruptListings']=skipped
+            meta['partialPage']=True
+            self.last_error=f'PropertyHub: skipped {skipped} invalid GraphQL listing(s) on page {page}'
+        if meta.get('totalCount') is not None:
+            # Child requests have a different perPage: do not leak the child's
+            # pagination totalPages into the parent 60-item cursor.
+            meta['totalPages']=ceil(int(meta['totalCount'])/per_page)
+        return rows,meta
 
     async def details(self,x:dict)->dict:
         """Confirmed live endpoint: /_next/data/<buildId>/en/listings/<slug>---<id>.json.
