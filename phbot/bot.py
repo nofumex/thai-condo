@@ -19,6 +19,7 @@ from .db import Database
 from .propertyhub import PropertyHub,ProviderError,image_url,price_of,plain_html
 from .filters import DEFAULT,AMENITIES,FACILITIES,ROOM_TYPES,SORTS,clean,concise,matches_local
 from .ranking import score,comparables,age_days
+from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
@@ -44,6 +45,13 @@ class Catalog:
     view_epoch:int=0
     detail_mode:bool=False
     detail_task:Optional[asyncio.Task]=None
+    next_page:int=1
+    total_pages:int=1
+    provider_total:int=0
+    empty_message:Optional[int]=None
+    progress_message:Optional[int]=None
+    load_lock:asyncio.Lock=field(default_factory=asyncio.Lock)
+    want_next:bool=False
 
 class Application:
     def __init__(self,cfg:Config):
@@ -101,11 +109,28 @@ class Application:
     async def _cleanup_catalog(self,c):
         await self._clear_details(c)
         await self.safe_delete(c.chat_id,c.message_id)
+        await self.safe_delete(c.chat_id,c.empty_message)
+        await self.safe_delete(c.chat_id,c.progress_message)
 
     async def filters(self,uid,chat,kind):
         self.panel_kind[uid]='filter:'+kind
         f=await self.db.get_filters(uid,kind)
         await self.panel(uid,chat,filter_summary(kind,f),filter_kb(kind,f))
+
+    async def district_panel(self,uid,chat,kind,f):
+        prefix='f:'+('s' if kind=='search' else 'l')+':'
+        if not f['region']:
+            rows=[[b(CITIES[k].title,prefix+'locpreset:'+k)] for k in CITIES]
+            rows.append([b('← Назад',prefix+'menu')])
+            await self.panel(uid,chat,'<b>📍 Районы</b>\nСначала выберите город.',kb(rows))
+            return
+        areas=[a for a in AREAS if a.city==f['region']]
+        rows=[[b(('✅ ' if a.id in f['district_ids'] else '▫️ ')+f'{a.name} · {a.rating:g}/10',
+                 prefix+'district_toggle:'+a.id)] for a in areas]
+        rows.append([b('Снять выбор районов',prefix+'district_clear')])
+        rows.append([b('← Фильтры',prefix+'menu')])
+        await self.panel(uid,chat,'<b>📍 Районы · '+esc(CITIES[f['region']].title)+'</b>\n\n'
+                         '<i>Приближённые зоны по координатам. Можно выбрать несколько.</i>',kb(rows))
 
     async def _clear_details(self,c:Catalog):
         c.detail_mode=False
@@ -127,8 +152,11 @@ class Application:
         if item is None:return
         uid=c.owner
         favorite=await self.db.is_marked(uid,item['id'],'favorites')
-        text=card_text(item,favorite,c.scores.get(str(item['id'])),self.fx.rate)
-        markup=card_kb(item,index,len(c.ids),favorite,c.fetching)
+        # Never rely on saved rank: favorites must depreciate with elapsed time.
+        ranked_items=await self.db.listings_by_ids(c.ids[:800])
+        current_score,_=score(item,comparables(ranked_items))
+        text=card_text(item,favorite,current_score,self.fx.rate)
+        markup=card_kb(item,index,len(c.ids),favorite,not c.done,c.provider_total if c.source!='collection' else None)
         photo=image_url(item.get('coverPicture'))
         cached_photo=self.photo_cache.get(str(item['id']))
         if replace and c.message_id:
@@ -163,78 +191,109 @@ class Application:
         await self.db.metric(uid,'cards')
 
     async def _load(self,c:Catalog):
-        """First page makes first card visible; subsequent pages append in background."""
-        uid=c.owner;progress=None;gen=c.generation
-        try:
-            progress=await self.bot.send_message(c.chat_id,'🔎 <b>Поиск по фильтрам выполняется…</b>\n<i>Первое объявление появится сразу после ответа PropertyHub.</i>',parse_mode='HTML')
-            await self.db.metric(uid,'requests')
-            page=1
-            target=100
-            total_pages=5 if c.filters.get('location_text') else 3
+        """Cursor-driven search. No 100-item cap; later pages load on demand.
+        An empty intermediate page must never be reported as global no-results.
+        """
+        if c.done or c.load_lock.locked():return
+        async with c.load_lock:
+            gen=c.generation;uid=c.owner
             c.fetching=True
-            while page<=total_pages and len(c.ids)<target and gen==c.generation:
-                rows,pag=await self.api.search_page(c.filters,page=page,per_page=60)
-                await self.db.put_listings(rows)
+            progress=None
+            try:
+                progress=await self.bot.send_message(c.chat_id,
+                    '🔎 <b>Загружаю объявления…</b>',parse_mode='HTML')
+                c.progress_message=progress.message_id
+                await self.db.metric(uid,'requests')
                 hidden=set(await self.db.listing_ids(uid,'hidden'))
                 have=set(c.ids)
-                for x in rows:
-                    id=str(x.get('id') or '')
-                    if id and id not in hidden and id not in have:
-                        c.ids.append(id);have.add(id)
-                # GraphQL can promote sponsored posts; re-sort the sampled pool locally.
-                if c.filters.get('sort') in ('CREATED_AT','REFRESHED_AT','PRICE_MONTHLY_LOW_TO_HIGH'):
-                    active_id = c.ids[c.index] if c.message_id and c.ids else None
-                    items = await self.db.listings_by_ids(c.ids)
-                    if c.filters['sort']=='PRICE_MONTHLY_LOW_TO_HIGH':
-                        items.sort(key=lambda x:float(price_of(x) or 1e30))
-                    else:
-                        field='createdAt' if c.filters['sort']=='CREATED_AT' else 'refreshedAt'
-                        items.sort(key=lambda x:str(x.get(field) or ''),reverse=True)
-                    sorted_ids=[str(x['id']) for x in items[:target]]
-                    if active_id and active_id not in sorted_ids and active_id in have:
-                        sorted_ids[-1]=active_id
-                    c.ids=sorted_ids
-                    if active_id in c.ids:c.index=c.ids.index(active_id)
-                if page==1:
-                    await self.safe_delete(c.chat_id,progress.message_id);progress=None
-                    if c.ids:await self._send_card(c,0,replace=False)
-                    else:
-                        m=await self.bot.send_message(c.chat_id,'⏳ На первой странице подходящих вариантов нет, проверяю следующие…')
-                        progress=m
-                if page >= int(pag.get('totalPages') or 1):break
-                page+=1
-                if len(c.ids)<target:await asyncio.sleep(.25)
-            c.fetching=False;c.done=True
-            # Update the counter without re-sending the card/photo.
-            if c.message_id and c.ids:
-                try:
+                # Scan until the next useful batch; local deposit/date/district
+                # filters can make some pages empty. A user may request more.
+                scanned=0
+                old_count=len(c.ids)
+                while gen==c.generation and scanned<8 and not c.done:
+                    page=c.next_page
+                    rows,pag=await self.api.search_page(c.filters,page=page,per_page=60)
+                    await self.db.put_listings(rows)
+                    c.provider_total=int(pag.get('totalCount') or c.provider_total or 0)
+                    c.total_pages=max(1,int(pag.get('totalPages') or 1))
+                    c.next_page=page+1
+                    scanned+=1
+                    for x in rows:
+                        ident=str(x.get('id') or '')
+                        if ident and ident not in hidden and ident not in have:
+                            c.ids.append(ident);have.add(ident)
+                    if c.next_page>c.total_pages:c.done=True
+                    if c.source=='collection' and c.ids:
+                        items=await self.db.listings_by_ids(c.ids)
+                        groups=comparables(items)
+                        # Rank the current fetched sample, not stale unrelated
+                        # listings from previous searches/settings.
+                        active=c.ids[c.index] if c.message_id and c.ids else None
+                        ranked=sorted(items,key=lambda x:score(x,groups)[0],reverse=True)
+                        c.ids=[str(x['id']) for x in ranked]
+                        if active in c.ids:c.index=c.ids.index(active)
+                    # First card after first matching page. On a subsequent
+                    # load, stop after collecting roughly one extra page.
+                    if len(c.ids)>old_count and (not c.message_id or len(c.ids)-old_count>=40):break
+                    if not c.done:await asyncio.sleep(.15)
+
+                if gen!=c.generation:return
+                if c.ids and c.empty_message:
+                    await self.safe_delete(c.chat_id,c.empty_message)
+                    c.empty_message=None
+                if c.want_next and c.message_id and c.index+1<len(c.ids):
+                    c.want_next=False
+                    await self._send_card(c,c.index+1)
+                if c.ids and not c.message_id:
+                    if c.empty_message:
+                        await self.safe_delete(c.chat_id,c.empty_message)
+                        c.empty_message=None
+                    await self._send_card(c,0,replace=False)
+                elif c.ids and c.message_id:
                     x,_=await self.db.get_listing(c.ids[c.index])
                     fav=await self.db.is_marked(uid,x['id'],'favorites')
-                    await self.bot.edit_message_reply_markup(chat_id=c.chat_id,message_id=c.message_id,
-                        reply_markup=card_kb(x,c.index,len(c.ids),fav,False))
-                except (TelegramBadRequest,TelegramForbiddenError):pass
-            if progress:
-                await self.safe_delete(c.chat_id,progress.message_id)
-                if not c.ids:
-                    await self.bot.send_message(c.chat_id,'Ничего не найдено. Попробуйте ослабить фильтры.',reply_markup=kb([[b('← Фильтры','filter:search')],[b('🏠 Меню','go:home')]]))
-            # No unsolicited extra messages on successful completion.
-        except asyncio.CancelledError:
-            if progress:await self.safe_delete(c.chat_id,progress.message_id)
-            raise
-        except Exception as e:
-            c.fetching=False;c.done=True
-            log.warning('search error: %s',e)
-            if progress:
-                try:await self.bot.edit_message_text(f'⚠️ Не удалось получить объявления.\n<code>{esc(str(e)[:260])}</code>',
-                    chat_id=c.chat_id,message_id=progress.message_id,parse_mode='HTML',
-                    reply_markup=kb([[b('↻ Повторить','go:'+('latest' if c.source=='latest' else 'searchrun'))],[b('← Меню','go:home')]]))
-                except TelegramBadRequest:pass
-            elif c.message_id:await self.bot.send_message(c.chat_id,'⚠️ Ошибка догрузки. Уже найденные объявления доступны.')
+                    try:
+                        await self.bot.edit_message_reply_markup(
+                            chat_id=c.chat_id,message_id=c.message_id,
+                            reply_markup=card_kb(x,c.index,len(c.ids),fav,not c.done,
+                                c.provider_total if c.source!='collection' else None))
+                    except (TelegramBadRequest,TelegramForbiddenError):pass
+                else:
+                    text=('Ничего не найдено по заданным фильтрам.' if c.done else
+                          f'Пока нет совпадений на первых {c.next_page-1} страницах. Можно проверить следующие.')
+                    buttons=[] if c.done else [[b('🔎 Проверить дальше','card:more')]]
+                    buttons += [[b('← Фильтры','filter:latest' if c.source in ('latest','collection') else 'filter:search')],
+                                [b('🏠 Меню','go:home')]]
+                    if c.empty_message:
+                        try:await self.bot.edit_message_text(text,chat_id=c.chat_id,
+                                    message_id=c.empty_message,reply_markup=kb(buttons))
+                        except TelegramBadRequest:pass
+                    else:
+                        m=await self.bot.send_message(c.chat_id,text,reply_markup=kb(buttons))
+                        c.empty_message=m.message_id
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning('search error: %s',e)
+                msg='⚠️ Ошибка поиска: '+esc(str(e)[:280])
+                markup=kb([[b('↻ Повторить','card:more')],[b('🏠 Меню','go:home')]])
+                if c.empty_message:
+                    try:await self.bot.edit_message_text(msg,chat_id=c.chat_id,
+                           message_id=c.empty_message,parse_mode='HTML',reply_markup=markup)
+                    except TelegramBadRequest:pass
+                else:
+                    m=await self.bot.send_message(c.chat_id,msg,parse_mode='HTML',reply_markup=markup)
+                    c.empty_message=m.message_id
+            finally:
+                c.fetching=False
+                if progress:
+                    await self.safe_delete(c.chat_id,progress.message_id)
+                    if c.progress_message==progress.message_id:c.progress_message=None
 
     async def launch(self,uid,chat,kind,filters=None):
         await self.close_catalog(uid)
         if kind in ('search','latest'):
-            f=clean(filters or await self.db.get_filters(uid,'latest' if kind=='latest' else 'search'))
+            f=clean(filters if filters is not None else await self.db.get_filters(uid,kind))
             c=Catalog(chat,uid,kind,'Новые' if kind=='latest' else 'Поиск',f)
             self.catalogs[uid]=c;c.worker=self.task(self._load(c));return
         if kind=='favorites':
@@ -242,41 +301,19 @@ class Application:
             hidden=set(await self.db.listing_ids(uid,'hidden'))
             ids=[x for x in ids if x not in hidden]
             if not ids:
-                await self.panel(uid,chat,'<b>❤️ Избранное</b>\n\nПока ничего нет. Добавляйте объявления кнопкой 🤍.',kb([[b('← Главное меню','go:home')]]))
+                await self.panel(uid,chat,'<b>❤️ Избранное</b>\n\nПока ничего нет. Сохраняйте объявления кнопкой 🤍.',kb([[b('← Главное меню','go:home')]]))
                 return
             c=Catalog(chat,uid,'favorites','Избранное',clean(DEFAULT),ids=ids,done=True)
             self.catalogs[uid]=c;await self._send_card(c,0,replace=False)
             return
         if kind.startswith('collection:'):
-            days=int(kind.split(':')[-1]);all_items=await self.db.all_listings()
-            filters=await self.db.get_filters(uid,'latest')
-            matches=[]
-            for x in all_items:
-                rent=price_of(x);size=(x.get('roomInformation') or {}).get('roomArea')
-                try:
-                    if not (filters['price_min']<=rent<=filters['price_max']):continue
-                    if filters['room_type']!='ANY' and (x.get('roomInformation') or {}).get('roomType')!=filters['room_type']:continue
-                    if filters['area_min'] is not None and (size is None or float(size)<filters['area_min']):continue
-                    if filters['area_max'] is not None and (size is None or float(size)>filters['area_max']):continue
-                    if not matches_local(x,filters):continue
-                    if age_days(x)>days:continue
-                except (TypeError,ValueError):continue
-                matches.append(x)
-            hidden=set(await self.db.listing_ids(uid,'hidden'))
-            groups=comparables(all_items)
-            ranked=[]
-            for x in matches:
-                if str(x['id']) in hidden:continue
-                val,conf=score(x,groups)
-                if conf>=.45:ranked.append((val,conf,x))
-            ranked.sort(key=lambda t:(t[0],t[1]),reverse=True)
-            if not ranked:
-                await self.panel(uid,chat,f'<b>🏆 Подборка · {days} дн.</b>\n\nПока нет достаточно полных объявлений в локальной выборке. Можно запустить «Новые», чтобы пополнить данные.',kb([[b('← Подборки','go:collections')],[b('🏠 Меню','go:home')]]))
-                return
-            top=ranked[:100]
-            c=Catalog(chat,uid,'collection','Подборки',filters,ids=[str(x[2]['id']) for x in top],done=True,
-                      scores={str(x[2]['id']):x[0] for x in top})
-            self.catalogs[uid]=c;await self._send_card(c,0,False)
+            days=int(kind.split(':')[-1])
+            f=await self.db.get_filters(uid,'latest')
+            # The preset applies on top of the CURRENT persistent profile.
+            cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).date().isoformat()
+            if not f.get('date_from') or f['date_from']<cutoff:f['date_from']=cutoff
+            c=Catalog(chat,uid,'collection',f'Подборка за {days} дн.',clean(f))
+            self.catalogs[uid]=c;c.worker=self.task(self._load(c))
 
     async def show_detail(self,c:Catalog):
         if not c.ids:return
@@ -291,7 +328,13 @@ class Application:
                     await self.db.store_detail(item['id'],detail)
                 except ProviderError as e:
                     log.warning('detail fallback: %s',e)
-                    detail=item
+                    if c.detail_mode:
+                        msg=await self.bot.send_message(c.chat_id,
+                            '⚠️ Полная карточка временно недоступна на PropertyHub.\n'
+                            'Основные характеристики уже показаны выше.',
+                            reply_markup=detail_kb(item))
+                        c.extra_messages.append(msg.message_id)
+                    return
             if not c.detail_mode:return
             # Summary and full original description are separated to remain within Telegram limits.
             v=dict(detail);description=plain_html(v.pop('detail', '') or '')
@@ -299,7 +342,8 @@ class Application:
             # Protect Telegram's 4096-character HTML limit.
             if len(summary)>3650:summary=summary[:3600]+'…'
             images=(detail.get('images') or []) if isinstance(detail,dict) else []
-            paths=[image_url(v.get('pictureUrl')) for v in images if isinstance(v,dict) and v.get('pictureUrl')]
+            paths=list(dict.fromkeys(image_url(v.get('pictureUrl')) for v in images
+                                  if isinstance(v,dict) and v.get('pictureUrl')))
             # Real gallery is sent only on Details, not on every card flip.
             if len(paths)>1:
                 try:
@@ -339,23 +383,40 @@ class Application:
         for x in rows:
             rent=price_of(x)
             if rent is None:continue
+            area=district_of(x)
             p=x.get('project') or {}
-            key=(p.get('address') if by=='district' else p.get('nameEnglish') or p.get('name'))
+            key=(area.id if area else None) if by!='project' else (p.get('nameEnglish') or p.get('name'))
             if key:grouped[key].append(float(rent))
-        ranked=sorted(grouped.items(),key=lambda t:len(t[1]),reverse=True)[:15]
-        lines=[f'<b>📊 Рынок · {"Районы" if by=="district" else "Жилые комплексы"}</b>',
-               f'📦 В локальной базе: {len(rows)} объявлений',
-               '<i>Средние цены только по сохранённой выборке, а не по всему рынку. Повторные объявления могут влиять на оценку.</i>','']
-        for name,prices in ranked:
-            avg=round(mean(prices))
-            rub=self.fx.rub(avg)
-            value=f'{money(avg)} ฿'+(f' · ≈{money(rub)} ₽' if rub else '')
-            lines.append(f'<b>{esc(str(name)[:48])}</b>\n{value} · {len(prices)} объявл.')
-        if not ranked:lines.append('Пока недостаточно данных. Запустите «Новые» или «Поиск».')
-        text='\n\n'.join(lines)
-        if len(text)>3950:text=text[:3900]+'…'
         self.panel_kind[uid]='market'
-        await self.panel(uid,chat,text,kb([[b('📍 Районы','market:district'),b('🏙 ЖК','market:project')],[b('← Меню','go:home')]]))
+        if by=='district':
+            text=('<b>📊 Рынок · Районы Таиланда</b>\n\n'
+                 'Выберите город: все районы и редакционные оценки 1–10.\n'
+                 '<i>Оценки субъективны, ориентированы на долгосрочную жизнь экспатов.\n'
+                 'Средние цены основаны только на локальной выборке, не на всём рынке.</i>')
+            buttons=[[b(CITIES[x].title,'market:city:'+x)] for x in CITIES]
+        elif by.startswith('city:'):
+            city=by.split(':',1)[1]
+            if city not in CITIES:city='bangkok'
+            lines=[f'<b>📍 {esc(CITIES[city].title)} · районы</b>','<i>Рейтинг редакционный, не официальный. Границы приближённые.</i>']
+            for area in sorted((a for a in AREAS if a.city==city),key=lambda x:x.rating,reverse=True):
+                prices=grouped.get(area.id) or []
+                suffix=f' · {money(mean(prices))} ฿/мес. (n={len(prices)})' if prices else ' · данных о цене пока нет'
+                lines.append(f'• <b>{esc(area.name)}</b> — <b>{area.rating:g}/10</b>\n'
+                             f'  {esc(area.reason)}{suffix}')
+            text='\n\n'.join(lines)
+            buttons=[[b('← Все города','market:district')]]
+        else:
+            ranked=sorted(grouped.items(),key=lambda t:len(t[1]),reverse=True)[:20]
+            lines=['<b>🏙 Рынок · ЖК</b>',f'Локально проиндексировано: {len(rows)}',
+                   '<i>Цена — среднее по найденным объявлениям, не всему рынку.</i>']
+            for name,prices in ranked:
+                if not name:continue
+                lines.append(f'<b>{esc(str(name)[:48])}</b> · {money(mean(prices))} ฿ · n={len(prices)}')
+            text='\n\n'.join(lines)
+            buttons=[[b('📍 Районы','market:district')]]
+        if len(text)>3900:text=text[:3850]+'…'
+        buttons.append([b('🏠 Меню','go:home')])
+        await self.panel(uid,chat,text,kb(buttons))
 
     async def admin(self,uid,chat):
         if uid!=self.cfg.admin_id:return
@@ -414,7 +475,7 @@ class Application:
         @r.message(Command('menu'))
         async def menu(message:Message):
             if not message.from_user:return
-            await self.db.user(message.from_user);await self.home(message.from_user.id,message.chat.id)
+            await self.db.user(message.from_user);await self.close_catalog(message.from_user.id);await self.home(message.from_user.id,message.chat.id)
             await self.safe_delete(message.chat.id,message.message_id)
 
         @r.callback_query(F.data.startswith('go:'))
@@ -433,7 +494,7 @@ class Application:
             elif action=='collections':
                 await self.close_catalog(uid)
                 self.panel_kind[uid]='collections'
-                await self.panel(uid,chat,'<b>🏆 Подборки</b>\n\nЛучшие варианты по соотношению цены к похожим квартирам, площади, свежести и полноты данных.\n\n<i>Рейтинг считается по локальной выборке, не по всему PropertyHub. Используются настройки раздела «Новые».</i>',kb([
+                await self.panel(uid,chat,'<b>🏆 Подборки</b>\n\nЛучшие варианты по цене, цене за м², площади, этажу, спальням, депозиту, свежести и району.\n\n<i>Рейтинг по загруженной выборке. Используются только текущие постоянные настройки.</i>',kb([
                     [b('📅 1 день','go:collection:1'),b('🗓 7 дней','go:collection:7'),b('📆 30 дней','go:collection:30')],
                     [b('← Меню','go:home')]]))
             elif action.startswith('collection:'):await self.launch(uid,chat,action)
@@ -464,21 +525,38 @@ class Application:
                 val=bits[3] if len(bits)>3 else ''
                 locations={'bangkok':'Bangkok','phuket':'Phuket','pattaya':'Pattaya','chiangmai':'Chiang Mai','samui':'Samui','all':''}
                 if val in locations:
-                    f['location_text']=locations[val]
+                    f['region']=val if val in CITIES else ''
+                    f['location_text']=''
+                    f['district_ids']=[]
                     await self.db.save_filters(uid,kind,f)
                 await self.filters(uid,chat,kind);return
             if action=='location':
                 rows=[[b('🏙 Бангкок',prefix+'locpreset:bangkok'),b('🌊 Паттайя',prefix+'locpreset:pattaya')],
                       [b('🏝 Пхукет',prefix+'locpreset:phuket'),b('🌿 Чиангмай',prefix+'locpreset:chiangmai')],
                       [b('🌴 Самуи',prefix+'locpreset:samui'),b('🌏 Весь Таиланд',prefix+'locpreset:all')],
-                      [b('✍️ Ввести район вручную',prefix+'loccustom')],[b('← Назад',prefix+'menu')]]
-                await self.panel(uid,chat,'<b>📍 География</b>\n\n<i>Быстрый выбор фильтрует загруженные объявления по адресу. Для строгого серверного поиска можно указать ID зоны.</i>',kb(rows))
+                      [b('🔤 Поиск по названию / адресу',prefix+'loccustom')],[b('← Назад',prefix+'menu')]]
+                await self.panel(uid,chat,'<b>🌏 Город</b>\n\nПоиск по городским зонам PropertyHub; проверка координат в выдаче.',kb(rows))
                 return
-            if action in ('price','area','loccustom','zone'):
-                prompts={'price':'Введите цену от и до (THB), через пробел. Например: 10000 15000',
+            if action=='district':
+                await self.district_panel(uid,chat,kind,f);return
+            if action=='district_toggle':
+                area=bits[3] if len(bits)>3 else ''
+                if area in AREAS_BY_ID and AREAS_BY_ID[area].city==f['region']:
+                    if area in f['district_ids']:f['district_ids'].remove(area)
+                    else:f['district_ids'].append(area)
+                    await self.db.save_filters(uid,kind,f)
+                await self.district_panel(uid,chat,kind,f);return
+            if action=='district_clear':
+                f['district_ids']=[]
+                await self.db.save_filters(uid,kind,f)
+                await self.district_panel(uid,chat,kind,f);return
+            if action in ('price','area','loccustom','zone','deposit','dates'):
+                prompts={'price':'Введите цену от и до (THB): 10000 15000. Сброс: -',
                     'area':'Введите площадь от и до (м²): 25 45. Для сброса: -',
                     'loccustom':'Введите название района / города / ЖК латиницей. Для сброса: -',
-                    'zone':'Введите ID зон через запятую или ID ЖК как project:3212. Для сброса: -'}
+                    'zone':'Введите ID зон через запятую или ID ЖК как project:3212. Для сброса: -',
+                    'deposit':'Максимальный депозит (в месяцах аренды): 1 или 2. Сброс: -',
+                    'dates':'Даты публикации ГГГГ-ММ-ДД ГГГГ-ММ-ДД. Для открытой границы: -. Для полного сброса: -'}
                 self.pending[uid]=(kind,action,0)
                 m=await self.bot.send_message(chat,'✍️ '+prompts[action]+'\n<i>Сообщение с ответом будет удалено.</i>',parse_mode='HTML')
                 self.pending[uid]=(kind,action,m.message_id)
@@ -525,7 +603,7 @@ class Application:
             raw=(m.text or '').strip()
             try:
                 if field in ('price','area'):
-                    if raw=='-' and field=='area':f['area_min']=f['area_max']=None
+                    if raw=='-':f[field+'_min']=f[field+'_max']=None
                     else:
                         parts=raw.replace(',','.').split()
                         if len(parts)!=2:raise ValueError('Введите два числа через пробел')
@@ -533,6 +611,23 @@ class Application:
                         if any(x<0 for x in nums) or nums[0]>nums[1]:raise ValueError('Некорректный диапазон')
                         if field=='price':f['price_min'],f['price_max']=int(nums[0]),int(nums[1])
                         else:f['area_min'],f['area_max']=nums
+                elif field=='deposit':
+                    if raw=='-':f['deposit_max_months']=None
+                    else:
+                        n=float(raw.replace(',','.'))
+                        if n<0 or n>12:raise ValueError('Допустимо от 0 до 12 месяцев')
+                        f['deposit_max_months']=n
+                elif field=='dates':
+                    if raw=='-':f['date_from']=f['date_to']=None
+                    else:
+                        parts=raw.split()
+                        if len(parts)!=2:raise ValueError('Нужно две даты через пробел')
+                        for part in parts:
+                            if part!='-':datetime.strptime(part,'%Y-%m-%d')
+                        f['date_from']=None if parts[0]=='-' else parts[0]
+                        f['date_to']=None if parts[1]=='-' else parts[1]
+                        if f['date_from'] and f['date_to'] and f['date_from']>f['date_to']:
+                            raise ValueError('Начало не может быть позже конца')
                 elif field=='loccustom':f['location_text']='' if raw=='-' else raw[:80]
                 elif field=='zone':
                     if raw=='-':f['zone_ids']=[];f['project_id']=None
@@ -556,7 +651,12 @@ class Application:
             await q.answer()
             uid=q.from_user.id
             c=self.catalogs.get(uid)
-            if not c or c.message_id!=q.message.message_id and q.data!='card:detailback':return
+            if not c:return
+            if q.data=='card:more':
+                if c.empty_message==q.message.message_id and not c.done and not c.fetching:
+                    c.worker=self.task(self._load(c))
+                return
+            if c.message_id!=q.message.message_id and q.data!='card:detailback':return
             action=q.data.split(':',1)[1]
             if action=='noop':return
             if action=='back':
@@ -566,8 +666,14 @@ class Application:
             if action in ('prev','next'):
                 if c.detail_mode:await self._clear_details(c)
                 index=c.index+(-1 if action=='prev' else 1)
-                if index<0 or index>=len(c.ids):return
+                if index<0:return
+                if index>=len(c.ids):
+                    c.want_next=True
+                    if not c.done and not c.fetching:c.worker=self.task(self._load(c))
+                    return
                 await self._send_card(c,index)
+                if index>=len(c.ids)-2 and not c.done and not c.fetching:
+                    c.worker=self.task(self._load(c))
             elif action=='heart':
                 await self.db.toggle(uid,id,'favorites')
                 await self._send_card(c,c.index)
@@ -584,12 +690,13 @@ class Application:
                 c.detail_mode=True
                 c.detail_task=self.task(self.show_detail(c))
             elif action=='detailback':
+                if c.detail_task and not c.detail_task.done():c.detail_task.cancel()
                 await self._clear_details(c)
                 # The original card remains in place, so no new message needed.
 
         @r.callback_query(F.data.startswith('market:'))
         async def market_callback(q:CallbackQuery):
-            await q.answer();await self.market(q.from_user.id,q.message.chat.id,q.data.split(':')[1])
+            await q.answer();await self.market(q.from_user.id,q.message.chat.id,q.data.split(':',1)[1])
 
         @r.callback_query(F.data.startswith('admin:'))
         async def admin_callback(q:CallbackQuery):

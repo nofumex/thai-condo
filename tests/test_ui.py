@@ -22,7 +22,7 @@ from test_core import listing
 
 class UITests(unittest.TestCase):
     def test_main_seven_buttons(self):
-        rows=main_kb().inline_keyboard
+        rows=main_kb(True).inline_keyboard
         self.assertEqual([len(x) for x in rows],[2,2,2,1])
         self.assertEqual(rows[0][0].text,'🆕 Новые')
         self.assertEqual(rows[0][1].text,'🔎 Поиск и фильтры')
@@ -34,7 +34,7 @@ class UITests(unittest.TestCase):
         self.assertIn('---123',rows[2][1].url)
     def test_filter_keyboard(self):
         row=filter_kb('search',clean({'amenities':['hasWasher']})).inline_keyboard
-        self.assertIn('1',row[2][0].text)
+        self.assertIn('1',row[3][0].text)
     def test_html_safe_and_rent_terms(self):
         x=listing(123)
         x['project']['nameEnglish']='<b>bad</b>'

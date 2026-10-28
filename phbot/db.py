@@ -22,7 +22,7 @@ class Database:
         );
         CREATE TABLE IF NOT EXISTS listings (
           id TEXT PRIMARY KEY, json TEXT NOT NULL, created_at TEXT, refreshed_at TEXT,
-          first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, detail_json TEXT
+          first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, detail_json TEXT, detail_saved_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_listings_created ON listings(created_at DESC);
         CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER NOT NULL,listing_id TEXT NOT NULL,
@@ -31,6 +31,11 @@ class Database:
           created_at TEXT NOT NULL, PRIMARY KEY(user_id,listing_id));
         CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         ''')
+        # Safe migration for databases created by earlier bot versions.
+        async with self.conn.execute('PRAGMA table_info(listings)') as cursor:
+            cols={r['name'] for r in await cursor.fetchall()}
+        if 'detail_saved_at' not in cols:
+            await self.conn.execute('ALTER TABLE listings ADD COLUMN detail_saved_at TEXT')
         await self.conn.commit()
     async def close(self):
         if self.conn:await self.conn.close()
@@ -64,21 +69,31 @@ class Database:
            [(str(x['id']),json.dumps(x,ensure_ascii=False),x.get('createdAt'),x.get('refreshedAt'),now,now) for x in items if x.get('id')])
         await self.conn.commit()
     async def store_detail(self,id,detail):
-        await self.conn.execute('UPDATE listings SET detail_json=? WHERE id=?',(json.dumps(detail,ensure_ascii=False),str(id)))
+        await self.conn.execute('UPDATE listings SET detail_json=?,detail_saved_at=? WHERE id=?',(json.dumps(detail,ensure_ascii=False),utc(),str(id)))
         await self.conn.commit()
     async def get_listing(self,id):
-        row=await self._one('SELECT json,detail_json FROM listings WHERE id=?',(str(id),))
-        return (json.loads(row['json']),json.loads(row['detail_json']) if row['detail_json'] else None) if row else (None,None)
+        row=await self._one('SELECT json,detail_json,detail_saved_at FROM listings WHERE id=?',(str(id),))
+        if not row:return None,None
+        detail=None
+        if row['detail_json'] and row['detail_saved_at']:
+            try:
+                elapsed=datetime.now(timezone.utc)-datetime.fromisoformat(row['detail_saved_at'])
+                if elapsed<timedelta(hours=24):detail=json.loads(row['detail_json'])
+            except (ValueError,TypeError):pass
+        return json.loads(row['json']),detail
     async def all_listings(self,limit=12000):
         rows=await self._all('SELECT json FROM listings ORDER BY created_at DESC LIMIT ?',(limit,))
         return [json.loads(r['json']) for r in rows]
     async def listings_by_ids(self,ids):
         if not ids:return []
-        result=[]
-        for id in ids:
-            x,_=await self.get_listing(id)
-            if x:result.append(x)
-        return result
+        result={}
+        # SQLite parameter count differs by build; batches stay conservative.
+        for start in range(0,len(ids),400):
+            part=ids[start:start+400]
+            marks=','.join('?' for _ in part)
+            rows=await self._all(f'SELECT id,json FROM listings WHERE id IN ({marks})',tuple(map(str,part)))
+            result.update({r['id']:json.loads(r['json']) for r in rows})
+        return [result[str(id)] for id in ids if str(id) in result]
     async def listing_ids(self,uid,what='favorites'):
         if what not in ('favorites','hidden'):raise ValueError('bad table')
         rows=await self._all(f'SELECT listing_id FROM {what} WHERE user_id=? ORDER BY created_at DESC',(uid,))

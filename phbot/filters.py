@@ -1,6 +1,10 @@
-"""Explicitly supported PropertyHub GraphQL filters; never send unsupported keys."""
+"""Search profiles; only verified GraphQL fields go over the wire.
+Additional constraints are checked locally against full search result summaries.
+"""
 from __future__ import annotations
 from copy import deepcopy
+from datetime import date, datetime, timezone
+from .geography import CITIES, AREAS_BY_ID, city_of, district_of
 
 AMENITIES = {
     'hasAir':'Кондиционер', 'hasDigitalDoorLock':'Электронный замок',
@@ -34,67 +38,147 @@ ROOM_TYPES = {
     'TWO_BED_ROOM':'2 спальни', 'THREE_BED_ROOM':'3 спальни',
     'FOUR_BED_ROOM':'4 спальни', 'PENTHOUSE':'Пентхаус',
 }
-SORTS = {'CREATED_AT':'🆕 Сначала новые', 'REFRESHED_AT':'🔄 Обновлённые', 'PRICE_MONTHLY_LOW_TO_HIGH':'💰 Сначала дешёвые'}
+SORTS = {'CREATED_AT':'🆕 Сначала новые', 'REFRESHED_AT':'🔄 Обновлённые',
+         'PRICE_MONTHLY_LOW_TO_HIGH':'💰 Сначала дешёвые'}
+# Truly empty default profile: no price/area/city/date/deposit restrictions.
 DEFAULT = {
-    'price_min':10000, 'price_max':15000, 'area_min':None, 'area_max':None,
+    'price_min':None, 'price_max':None, 'area_min':None, 'area_max':None,
     'room_type':'ANY', 'sort':'CREATED_AT', 'amenities':[], 'facilities':[],
-    'zone_ids':[], 'project_id':None, 'location_text':'',
+    'zone_ids':[], 'project_id':None, 'location_text':'', 'region':'',
+    'district_ids':[], 'deposit_max_months':None, 'date_from':None, 'date_to':None,
 }
 
-def clean(raw:dict | None) -> dict:
-    out = deepcopy(DEFAULT)
+def _date(value):
+    if not value:return None
+    try:return date.fromisoformat(str(value)).isoformat()
+    except (ValueError,TypeError):return None
+
+def clean(raw:dict|None)->dict:
+    out=deepcopy(DEFAULT)
     if isinstance(raw,dict):
         for k in out:
-            if k in raw: out[k] = raw[k]
-    for k in ('price_min','price_max','area_min','area_max','project_id'):
-        try: out[k] = int(out[k]) if k in ('price_min','price_max','project_id') and out[k] is not None else float(out[k]) if out[k] is not None else None
-        except (TypeError,ValueError):out[k] = DEFAULT[k]
-    out['price_min'] = max(0, int(out['price_min'] or 0))
-    out['price_max'] = max(out['price_min'], int(out['price_max'] or out['price_min']))
-    out['amenities'] = sorted(set(out['amenities'] or []) & AMENITIES.keys())
-    out['facilities'] = sorted(set(out['facilities'] or []) & FACILITIES.keys())
-    out['room_type'] = out['room_type'] if out['room_type'] in ROOM_TYPES else 'ANY'
-    out['sort'] = out['sort'] if out['sort'] in SORTS else 'CREATED_AT'
-    out['location_text'] = str(out['location_text'] or '')[:80]
-    zones = out['zone_ids'] or []
-    out['zone_ids'] = [str(x) for x in zones if str(x).isdigit()][:20]
+            if k in raw:out[k]=raw[k]
+    for k in ('price_min','price_max','area_min','area_max','project_id','deposit_max_months'):
+        try:
+            v=out[k]
+            out[k]=float(v) if v is not None and v!='' else None
+            if out[k] is not None and (out[k]<0 or out[k]>1e9):out[k]=None
+            if k in ('price_min','price_max','project_id') and out[k] is not None:out[k]=int(out[k])
+        except (ValueError,TypeError,OverflowError):out[k]=None
+    for a,b in [('price_min','price_max'),('area_min','area_max')]:
+        if out[a] is not None and out[b] is not None and out[a]>out[b]:out[a],out[b]=out[b],out[a]
+    out['amenities']=sorted(set(out['amenities'] or []) & AMENITIES.keys())
+    out['facilities']=sorted(set(out['facilities'] or []) & FACILITIES.keys())
+    out['room_type']=out['room_type'] if out['room_type'] in ROOM_TYPES else 'ANY'
+    out['sort']=out['sort'] if out['sort'] in SORTS else 'CREATED_AT'
+    out['location_text']=str(out['location_text'] or '')[:80]
+    out['region']=out['region'] if out['region'] in CITIES else ''
+    zones=out['zone_ids'] or []
+    out['zone_ids']=[str(x) for x in zones if str(x).isdigit()][:20]
+    out['district_ids']=[x for x in (out['district_ids'] or []) if x in AREAS_BY_ID and (not out['region'] or AREAS_BY_ID[x].city==out['region'])][:60]
+    out['date_from']=_date(out['date_from']);out['date_to']=_date(out['date_to'])
+    if out['date_from'] and out['date_to'] and out['date_from']>out['date_to']:
+        out['date_from'],out['date_to']=out['date_to'],out['date_from']
     return out
 
-def attributes(filters:dict) -> dict:
+def attributes(filters:dict)->dict:
     f=clean(filters)
     result={'zoneIds':f['zone_ids'], 'postType':'FOR_RENT', 'propertyType':'CONDO'}
     if f['project_id']:result['projectId']=str(f['project_id'])
-    result['price']={'min':f['price_min'],'max':f['price_max']}
+    if f['price_min'] is not None or f['price_max'] is not None:
+        result['price']={'min':f['price_min'] if f['price_min'] is not None else 0,
+                         'max':f['price_max'] if f['price_max'] is not None else 1000000000}
     room={}
     if f['room_type']!='ANY':room['roomType']=f['room_type']
     if f['area_min'] is not None or f['area_max'] is not None:
-        def as_graph_number(x):
-            x=float(x)
-            return int(x) if x.is_integer() else x
-        room['roomArea']={'min':as_graph_number(f['area_min']) if f['area_min'] is not None else 0,
-                          'max':as_graph_number(f['area_max']) if f['area_max'] is not None else 100000}
+        def api_number(value):
+            number=float(value)
+            return int(number) if number.is_integer() else number
+        room['roomArea']={'min':api_number(f['area_min']) if f['area_min'] is not None else 0,
+                          'max':api_number(f['area_max']) if f['area_max'] is not None else 100000}
     if room:result['roomInformation']=room
-    if f['amenities']:result['amenities']={k:True for k in f['amenities']}
-    if f['facilities']:result['facilities']={k:True for k in f['facilities']}
+    # PropertyHub actually distinguishes apartment amenities (hasWasher, etc.)
+    # from building facilities (pool, fitness). Both are separate GraphQL keys.
+    # Old profiles used apartment keys for building facilities. Map these
+    # to confirmed GraphQL facilities.pool/fitness (not amenities.hasPool).
+    building_aliases={'hasPool':'pool','hasFitness':'fitness','hasSauna':'sauna',
+                      'hasSteam':'steam','hasSecurity':'security','hasCctv':'cctv',
+                      'hasLift':'lift','hasParking':'parking','hasPlayground':'playground',
+                      'hasShuttle':'shuttle','hasLaundry':'laundry','hasPark':'park',
+                      'hasStadium':'stadium','hasLibrary':'library','hasRestaurant':'restaurant',
+                      'hasShop':'shop','hasEvCharger':'evCharger','hasMotorcycleParking':'motorcycleParking'}
+    apartment=[k for k in f['amenities'] if k not in building_aliases]
+    facility=set(f['facilities'])|{building_aliases[k] for k in f['amenities'] if k in building_aliases}
+    if apartment:result['amenities']={k:True for k in apartment}
+    if facility:result['facilities']={k:True for k in sorted(facility)}
     return result
 
-def matches_local(item:dict, filters:dict)->bool:
-    term=clean(filters)['location_text'].strip().casefold()
-    if not term:return True
-    p=item.get('project') or {}
-    hay=' '.join(str(x or '') for x in (p.get('name'),p.get('nameEnglish'),p.get('address'),item.get('address'))).casefold()
-    return term in hay
+def deposit_terms(item):
+    """(deposit amount THB, deposit in months). None means unknown, not zero."""
+    rental=((item.get('priceLandAndHouse') or {}).get('forRent') or {})
+    old=((item.get('price') or {}).get('forRent') or {})
+    dep=rental.get('deposit') or old.get('deposit') or {}
+    typ=dep.get('type')
+    amount=dep.get('amount')
+    month=dep.get('month')
+    from .propertyhub import price_of
+    price=price_of(item)
+    try:
+        if amount is not None and (typ in ('AMOUNT',None) or month is None):
+            amount=float(amount)
+            return amount,(amount/float(price) if price else None)
+        if month is not None:
+            month=float(month)
+            return (month*float(price) if price else None),month
+    except (ValueError,TypeError,ZeroDivisionError):pass
+    return None,None
 
+def matches_local(item:dict,filters:dict)->bool:
+    f=clean(filters)
+    if f['region'] and city_of(item)!=f['region']:return False
+    if f['district_ids']:
+        district=district_of(item)
+        if not district or district.id not in f['district_ids']:return False
+    term=f['location_text'].strip().casefold()
+    if term:
+        p=item.get('project') or {}
+        hay=' '.join(str(x or '') for x in (p.get('name'),p.get('nameEnglish'),p.get('address'),item.get('address'))).casefold()
+        if term not in hay:return False
+    amount,months=deposit_terms(item)
+    if f['deposit_max_months'] is not None:
+        if months is None or months>f['deposit_max_months']:return False
+    if f['date_from'] or f['date_to']:
+        try:
+            day=datetime.fromisoformat(str(item.get('createdAt')).replace('Z','+00:00')).date().isoformat()
+        except (ValueError,TypeError):return False
+        if f['date_from'] and day<f['date_from']:return False
+        if f['date_to'] and day>f['date_to']:return False
+    # Local validation also guards exact settings when a provider ignores a key.
+    from .propertyhub import price_of
+    price=price_of(item)
+    if f['price_min'] is not None and (price is None or float(price)<f['price_min']):return False
+    if f['price_max'] is not None and (price is None or float(price)>f['price_max']):return False
+    room=item.get('roomInformation') or {}
+    if f['room_type']!='ANY' and room.get('roomType')!=f['room_type']:return False
+    size=room.get('roomArea')
+    if f['area_min'] is not None and (size is None or float(size)<f['area_min']):return False
+    if f['area_max'] is not None and (size is None or float(size)>f['area_max']):return False
+    return True
 
 def concise(filters:dict)->str:
-    f=clean(filters)
-    words=[f"{f['price_min']:,}–{f['price_max']:,} ฿".replace(',',' ')]
+    f=clean(filters);words=[]
+    if f['price_min'] is not None or f['price_max'] is not None:
+        words.append(f"{f['price_min'] if f['price_min'] is not None else 0:g}–{f['price_max'] if f['price_max'] is not None else '∞'} ฿")
+    if f['region']:words.append('📍 '+CITIES[f['region']].title)
+    if f['district_ids']:words.append(f'Районов: {len(f["district_ids"])}')
     if f['room_type']!='ANY':words.append(ROOM_TYPES[f['room_type']])
     if f['area_min'] is not None or f['area_max'] is not None:
-        words.append(f"{f['area_min'] or 0:g}–{f['area_max'] or '∞'} м²")
-    if f['location_text']:words.append('📍'+f['location_text'])
+        words.append(f"{f['area_min'] if f['area_min'] is not None else 0:g}–{f['area_max'] if f['area_max'] is not None else '∞'} м²")
+    if f['deposit_max_months'] is not None:words.append(f'Депозит ≤ {f["deposit_max_months"]:g} мес.')
+    if f['date_from'] or f['date_to']:words.append(f"📅 {f['date_from'] or '…'} — {f['date_to'] or '…'}")
+    if f['location_text']:words.append('🔤 '+f['location_text'])
     n=len(f['amenities'])+len(f['facilities'])
     if n:words.append(f'✓ {n} удобств')
     if f['zone_ids']:words.append(f'Зон: {len(f["zone_ids"])}')
     if f['project_id']:words.append('ЖК #'+str(f['project_id']))
-    return ' · '.join(words)
+    return ' · '.join(words) if words else 'Без ограничений · весь Таиланд'
