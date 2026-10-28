@@ -26,7 +26,7 @@ from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_MAX_PAGES, 
                           COLLECTION_TARGET, signature, cache_expired, build_buckets)
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
-from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,card_text,card_kb,
+from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,payment_filter_text,payment_filter_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
 log=logging.getLogger(__name__)
 
@@ -493,6 +493,7 @@ class Application:
                 have=set(c.ids)
                 scanned=0
                 rare=bool(c.filters.get('deposit_max_months') is not None or
+                          c.filters.get('advance_max_months') is not None or
                           c.filters.get('district_ids') or c.filters.get('location_text') or
                           c.filters.get('date_from') or c.filters.get('date_to'))
                 page_budget=SEARCH_RARE_PAGES if rare else SEARCH_STANDARD_PAGES
@@ -836,12 +837,22 @@ class Application:
                 f['district_ids']=[]
                 await self._save_filters(uid,kind,f)
                 await self.district_panel(uid,chat,kind,f);return
-            if action in ('price','area','loccustom','zone','deposit','dates'):
+            if action=='payments':
+                await self.panel(uid,chat,payment_filter_text(f),payment_filter_kb(kind,f))
+                return
+            if action=='payments_clear':
+                f['deposit_max_months']=None
+                f['advance_max_months']=None
+                await self._save_filters(uid,kind,f)
+                await self.panel(uid,chat,payment_filter_text(f),payment_filter_kb(kind,f))
+                return
+            if action in ('price','area','loccustom','zone','deposit','advance','dates'):
                 prompts={'price':'Введите цену от и до (THB): 10000 15000. Сброс: -',
                     'area':'Введите площадь от и до (м²): 25 45. Для сброса: -',
                     'loccustom':'Введите название района / города / ЖК латиницей. Для сброса: -',
                     'zone':'Введите ID зон через запятую или ID ЖК как project:3212. Для сброса: -',
-                    'deposit':'Максимальный депозит (в месяцах аренды): 1 или 2. Сброс: -',
+                    'deposit':'Максимальный депозит (в месяцах аренды): например 1 или 2. Сброс: -',
+                    'advance':'Максимальная предоплата (в месяцах аренды): например 1 или 2. Сброс: -',
                     'dates':'Даты публикации ГГГГ-ММ-ДД ГГГГ-ММ-ДД. Для открытой границы: -. Для полного сброса: -'}
                 self.pending[uid]=(kind,action,0)
                 m=await self.bot.send_message(chat,'✍️ '+prompts[action]+'\n<i>Сообщение с ответом будет удалено.</i>',parse_mode='HTML')
@@ -902,12 +913,13 @@ class Application:
                                 raise ValueError(f'Цена не может превышать {GRAPHQL_INT_MAX:,} ฿ (лимит GraphQL Int)')
                             f['price_min'],f['price_max']=int(nums[0]),int(nums[1])
                         else:f['area_min'],f['area_max']=nums
-                elif field=='deposit':
-                    if raw=='-':f['deposit_max_months']=None
+                elif field in ('deposit','advance'):
+                    field_key='deposit_max_months' if field=='deposit' else 'advance_max_months'
+                    if raw=='-':f[field_key]=None
                     else:
                         n=float(raw.replace(',','.'))
                         if not isfinite(n) or n<0 or n>12:raise ValueError('Допустимо от 0 до 12 месяцев')
-                        f['deposit_max_months']=n
+                        f[field_key]=n
                 elif field=='dates':
                     if raw=='-':f['date_from']=f['date_to']=None
                     else:
@@ -931,7 +943,10 @@ class Application:
                 await self._save_filters(uid,kind,f)
                 await self.safe_delete(m.chat.id,m.message_id)
                 await self.safe_delete(m.chat.id,prompt)
-                await self.filters(uid,m.chat.id,kind)
+                if field in ('deposit','advance'):
+                    await self.panel(uid,m.chat.id,payment_filter_text(f),payment_filter_kb(kind,f))
+                else:
+                    await self.filters(uid,m.chat.id,kind)
             except (ValueError,TypeError) as e:
                 await self.safe_delete(m.chat.id,m.message_id)
                 await self.safe_delete(m.chat.id,prompt)

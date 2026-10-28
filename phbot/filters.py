@@ -46,7 +46,7 @@ DEFAULT = {
     'price_min':None, 'price_max':None, 'area_min':None, 'area_max':None,
     'room_type':'ANY', 'sort':'CREATED_AT', 'amenities':[], 'facilities':[],
     'zone_ids':[], 'project_id':None, 'location_text':'', 'region':'',
-    'district_ids':[], 'deposit_max_months':None, 'date_from':None, 'date_to':None,
+    'district_ids':[], 'deposit_max_months':None, 'advance_max_months':None, 'date_from':None, 'date_to':None,
 }
 
 def _date(value):
@@ -59,7 +59,7 @@ def clean(raw:dict|None)->dict:
     if isinstance(raw,dict):
         for k in out:
             if k in raw:out[k]=raw[k]
-    for k in ('price_min','price_max','area_min','area_max','project_id','deposit_max_months'):
+    for k in ('price_min','price_max','area_min','area_max','project_id','deposit_max_months','advance_max_months'):
         try:
             v=out[k]
             out[k]=float(v) if v is not None and v!='' else None
@@ -71,7 +71,7 @@ def clean(raw:dict|None)->dict:
                     out[k]=min(out[k],2_147_483_647)
                 elif k in ('area_min','area_max'):
                     out[k]=min(out[k],1_000_000)
-                elif k=='deposit_max_months':
+                elif k in ('deposit_max_months','advance_max_months'):
                     out[k]=min(out[k],12)
                 elif k=='project_id' and out[k]>1_000_000_000:
                     out[k]=None
@@ -125,25 +125,49 @@ def attributes(filters:dict)->dict:
     if facility:result['facilities']={k:True for k in sorted(facility)}
     return result
 
-def deposit_terms(item):
-    """(deposit amount THB, deposit in months). None means unknown, not zero."""
+def payment_terms(item, field):
+    """Rental payment as (THB, monthly-rent equivalents).
+
+    Missing/CALL values are unknown, never zero. Supports PropertyHub
+    MONTH or AMOUNT structures in both search and legacy result formats.
+    """
+    if field not in ('deposit', 'advancePayment'):
+        raise ValueError('Unsupported rental payment field')
     rental=((item.get('priceLandAndHouse') or {}).get('forRent') or {})
     old=((item.get('price') or {}).get('forRent') or {})
-    dep=rental.get('deposit') or old.get('deposit') or {}
-    typ=dep.get('type')
-    amount=dep.get('amount')
-    month=dep.get('month')
+    payment=rental.get(field) or old.get(field) or {}
+    if not isinstance(payment,dict):return None,None
+    typ=payment.get('type')
+    if typ in ('CALL', 'NO_INFORMATION', 'UNKNOWN'):return None,None
+    amount=payment.get('amount')
+    month=payment.get('month')
     from .propertyhub import price_of
     price=price_of(item)
     try:
         if amount is not None and (typ in ('AMOUNT',None) or month is None):
             amount=float(amount)
-            return amount,(amount/float(price) if price else None)
+            if not isfinite(amount) or amount<0:return None,None
+            monthly=float(price) if price is not None else None
+            if monthly is None or not isfinite(monthly) or monthly<=0:
+                return amount,None
+            return amount,amount/monthly
         if month is not None:
             month=float(month)
-            return (month*float(price) if price else None),month
-    except (ValueError,TypeError,ZeroDivisionError):pass
+            if not isfinite(month) or month<0:return None,None
+            monthly=float(price) if price is not None else None
+            if monthly is None or not isfinite(monthly) or monthly<=0:
+                return None,month
+            return month*monthly,month
+    except (ValueError,TypeError,OverflowError,ZeroDivisionError):pass
     return None,None
+
+def deposit_terms(item):
+    """Backward-compatible (deposit THB, months)."""
+    return payment_terms(item,'deposit')
+
+def advance_terms(item):
+    """(advance rent THB, months), independent from the deposit."""
+    return payment_terms(item,'advancePayment')
 
 def matches_local(item:dict,filters:dict)->bool:
     f=clean(filters)
@@ -156,9 +180,12 @@ def matches_local(item:dict,filters:dict)->bool:
         p=item.get('project') or {}
         hay=' '.join(str(x or '') for x in (p.get('name'),p.get('nameEnglish'),p.get('address'),item.get('address'))).casefold()
         if term not in hay:return False
-    amount,months=deposit_terms(item)
     if f['deposit_max_months'] is not None:
+        _,months=deposit_terms(item)
         if months is None or months>f['deposit_max_months']:return False
+    if f['advance_max_months'] is not None:
+        _,months=advance_terms(item)
+        if months is None or months>f['advance_max_months']:return False
     if f['date_from'] or f['date_to']:
         try:
             day=datetime.fromisoformat(str(item.get('createdAt')).replace('Z','+00:00')).date().isoformat()
@@ -187,6 +214,7 @@ def concise(filters:dict)->str:
     if f['area_min'] is not None or f['area_max'] is not None:
         words.append(f"{f['area_min'] if f['area_min'] is not None else 0:g}–{f['area_max'] if f['area_max'] is not None else '∞'} м²")
     if f['deposit_max_months'] is not None:words.append(f'Депозит ≤ {f["deposit_max_months"]:g} мес.')
+    if f['advance_max_months'] is not None:words.append(f'Предоплата ≤ {f["advance_max_months"]:g} мес.')
     if f['date_from'] or f['date_to']:words.append(f"📅 {f['date_from'] or '…'} — {f['date_to'] or '…'}")
     if f['location_text']:words.append('🔤 '+f['location_text'])
     n=len(f['amenities'])+len(f['facilities'])

@@ -39,7 +39,7 @@ def filter_kb(kind,f):
     rows=[
         [b('💰 Цена',prefix+'price'),b('📐 Площадь',prefix+'area')],
         [b('🛏 '+ROOM_TYPES.get(f['room_type'],'Тип'),prefix+'room'),b('↕️ Сортировка',prefix+'sort')],
-        [b('💳 Депозит',prefix+'deposit'),b('📅 Даты',prefix+'dates')],
+        [b('💳 Депозит / Предоплата',prefix+'payments'),b('📅 Даты',prefix+'dates')],
         [b(f'🧺 Квартира ({n})',prefix+'amen'),b(f'🏊 ЖК ({m})',prefix+'fac')],
         [b('🌏 Город',prefix+'location'),b('📍 Районы',prefix+'district')],
         [b('🔤 Название / адрес',prefix+'loccustom'),b('🆔 ID зоны / ЖК',prefix+'zone')],
@@ -48,6 +48,25 @@ def filter_kb(kind,f):
         [b('← Главное меню','go:home')]
     ]
     return kb(rows)
+
+def payment_filter_text(f):
+    def label(key):
+        value=f.get(key)
+        return 'без ограничения' if value is None else f'не более {value:g} мес.'
+    return ('<b>💳 Депозит / Предоплата</b>\n\n'
+            f'💳 Депозит: <b>{label("deposit_max_months")}</b>\n'
+            f'🔑 Предоплата: <b>{label("advance_max_months")}</b>\n\n'
+            '<i>Оба ограничения независимы. При отсутствии сведений '
+            'об обязательном платеже объявление не проходит соответствующий активный фильтр.</i>')
+
+def payment_filter_kb(kind,f):
+    prefix='f:'+('s' if kind=='search' else 'l')+':'
+    return kb([
+        [b('💳 Изменить депозит',prefix+'deposit')],
+        [b('🔑 Изменить предоплату',prefix+'advance')],
+        [b('🧹 Сбросить оба',prefix+'payments_clear')],
+        [b('← К фильтрам',prefix+'menu')],
+    ])
 
 def choices_kb(kind,category,f,offset=0):
     prefix='f:'+('s' if kind=='search' else 'l')+':'
